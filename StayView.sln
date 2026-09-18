@@ -1,0 +1,44 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{B5FB5827-EC8A-4487-9E66-FD2D81D6610E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "StayView", "src\StayView\StayView.csproj", "{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "StayView.Core", "src\StayView.Core\StayView.Core.csproj", "{BCA90CE8-DC45-447F-A164-46FF109E18CF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Debug|Any CPU.Build.0 = Debug|x64
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Debug|x64.ActiveCfg = Debug|x64
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Debug|x64.Build.0 = Debug|x64
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Release|Any CPU.ActiveCfg = Release|x64
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Release|Any CPU.Build.0 = Release|x64
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Release|x64.ActiveCfg = Release|x64
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859}.Release|x64.Build.0 = Release|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Debug|Any CPU.Build.0 = Debug|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Debug|x64.ActiveCfg = Debug|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Debug|x64.Build.0 = Debug|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Release|Any CPU.ActiveCfg = Release|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Release|Any CPU.Build.0 = Release|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Release|x64.ActiveCfg = Release|x64
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{CFFAB09C-7A95-4F6A-9CD7-E4B0468AB859} = {B5FB5827-EC8A-4487-9E66-FD2D81D6610E}
+		{BCA90CE8-DC45-447F-A164-46FF109E18CF} = {B5FB5827-EC8A-4487-9E66-FD2D81D6610E}
+	EndGlobalSection
+EndGlobal

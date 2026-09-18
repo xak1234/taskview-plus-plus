@@ -1,0 +1,17 @@
+Taskview++ 0.9.0-beta
+=====================
+
+Taskview on steroids.
+
+This is a beta test version, not a stable production release.
+
+Expect unfinished behavior, compatibility limitations, and bugs. Save important
+work before testing new builds and use it on systems where you are comfortable
+recovering from unexpected behavior.
+
+Taskview++ manages real application windows and, on supported Windows builds,
+uses private Windows virtual-desktop interfaces. Compatibility can change with
+Windows updates.
+
+Copyright (c) 2026 FranksApps
+Licensed under the MIT License. See LICENSE for details.
