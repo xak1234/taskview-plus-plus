@@ -15,6 +15,11 @@ public enum BrowseTarget
 // tick and must not pay for a foreground/catalog lookup.
 public static class BrowseReconciler
 {
+    // Reconcile every browsed window, not only the primary. A minimized, hidden,
+    // closed or departed secondary must release its suppressed miniature too.
+    public static IReadOnlyList<nint> AvailableWindows(IEnumerable<nint> browsed, Func<nint, bool> available)
+        => browsed.Where(h => h != 0 && available(h)).Distinct().ToArray();
+
     // `foregroundIsOwnCanvas` is the case that makes tile-dragging-while-focused possible.
     // Pressing a tile makes the overview HWND the foreground window, so after the gesture
     // ends the selected window is no longer foreground. Treating that as "some window we do
@@ -28,6 +33,7 @@ public static class BrowseReconciler
         bool foregroundIsOwnCanvas,
         nint foregroundSource)
     {
+        if (foreground == 0) return BrowseTarget.Keep; // transient activation handoff
         if (selected != 0 && (foreground == selected || foregroundRoot == selected)) return BrowseTarget.Keep;
         if (foregroundIsOwnCanvas) return BrowseTarget.Refront;
         if (foregroundSource != 0 && foregroundSource != selected) return BrowseTarget.Follow;

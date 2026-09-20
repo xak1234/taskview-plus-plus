@@ -10,11 +10,15 @@ public sealed class InputHooks : IDisposable
     bool fallback, spaceHeld, escapeHeld, active;
     volatile bool winKeyDown; // Win held, tracked by the keyboard hook for Win+drag
     // Only while browsing (a real window focused in front of the overview) does the mouse
-    // hook watch the focused window. Title-bar/top-strip presses can arm a drag; a deliberate
-    // product gesture also treats a double-click anywhere on the browsed window as
-    // "shrink back to the grid", so the second click is intentionally consumed.
+    // hook watch the focused window. Title bars shrink directly; client double-clicks
+    // are checked asynchronously for empty background. Controls keep their native input.
     bool browsing;
-    public bool Browsing { get => browsing; set { if(browsing!=value)lastDown=0; browsing = value; if (!value) { dragArmed = false; dragging = false; } } }
+    public bool Browsing { get => browsing; set { if(browsing!=value){lastDown=0; GestureVersion++; pendingClient=0;} browsing = value; if (!value) { dragArmed = false; dragging = false; } } }
+    public long GestureVersion { get; private set; }
+    bool lastWasCaption, lastWasClient;
+    nint pendingClient;
+    Native.POINT pendingFirst, pendingSecond;
+    public event Action<nint, Native.POINT, Native.POINT, long>? ClientDoubleClick;
     long lastDown;
     nint lastDownTarget;
     bool swallowRelease;
@@ -23,6 +27,7 @@ public sealed class InputHooks : IDisposable
     // The window a left-drag may move (the one currently browsed).
     public Func<nint>? BrowsedWindow;
     public event Action<nint>? WindowDragged;
+    public bool IsDragging => dragArmed;
     static readonly nuint DragSentinel = 0x53565744; // "SVWD": marks our own replayed click
     const int DragThreshold = 6;
     nint dragTarget;
@@ -52,8 +57,13 @@ public sealed class InputHooks : IDisposable
         // Consume the matching release even after browsing was disabled.
         if(msg==0x202 && swallowRelease){swallowRelease=false;return 1;}
         if(!browsing)return Native.CallNextHookEx(mouseHook, code, wp, lp);
+        if (msg is 0x204 or 0x207 or 0x20B or 0x20A or 0x20E)
+        { GestureVersion++; lastDown = 0; pendingClient = 0; }
         if (msg == 0x200) // WM_MOUSEMOVE
         {
+            if ((lastDown != 0 || pendingClient != 0)
+                && Math.Max(Math.Abs(mouse.Point.X - lastDownPoint.X), Math.Abs(mouse.Point.Y - lastDownPoint.Y)) >= DragThreshold)
+            { lastDown = 0; pendingClient = 0; GestureVersion++; }
             if (!dragArmed) return Native.CallNextHookEx(mouseHook, code, wp, lp);
             var mp = mouse.Point;
             if (!dragging)
@@ -91,20 +101,30 @@ public sealed class InputHooks : IDisposable
         if (msg != 0x201 && msg != 0x202) return Native.CallNextHookEx(mouseHook, code, wp, lp);
         if (msg == 0x201) // WM_LBUTTONDOWN
         {
+            GestureVersion++;
+            pendingClient = 0;
             var p = mouse.Point;
-            // A double-click ANYWHERE on a browsed window (title bar or content) shrinks it
-            // back to the grid. The first press still reaches the app (or arms a move);
-            // only the second press is swallowed, so a single click behaves as normal.
-            bool claimed = TryArmDrag(p, out var pressed);
+            // Caption and client gestures never combine. Only confirmed caption clicks
+            // are consumed here; empty-client classification happens outside the hook.
+            bool claimed = TryArmDrag(p, out var pressed, out var canShrink, out var isClient);
             long now = Environment.TickCount64; int dt = (int)Native.GetDoubleClickTime();
             int tolX = Math.Max(2, Native.GetSystemMetrics(36) / 2), tolY = Math.Max(2, Native.GetSystemMetrics(37) / 2);
-            if (pressed != 0 && lastDown != 0 && lastDownTarget == pressed && now - lastDown <= dt && Math.Abs(p.X - lastDownPoint.X) <= tolX && Math.Abs(p.Y - lastDownPoint.Y) <= tolY)
+            bool doubleClick = pressed != 0 && lastDown != 0 && lastDownTarget == pressed && now - lastDown <= dt && Math.Abs(p.X - lastDownPoint.X) <= tolX && Math.Abs(p.Y - lastDownPoint.Y) <= tolY;
+            if (canShrink && lastWasCaption && doubleClick)
             {
                 lastDown = 0; dragArmed = false; dragging = false;
                 swallowRelease = true;
                 DoubleClick?.Invoke(pressed); return 1;
             }
-            lastDown = pressed != 0 ? now : 0; lastDownPoint = p; lastDownTarget = pressed;
+            if (isClient && lastWasClient && doubleClick && !claimed)
+            {
+                // Let the app receive its complete click sequence. Only after mouse-up
+                // may an asynchronous accessibility check recognize empty background.
+                pendingClient = pressed; pendingFirst = lastDownPoint; pendingSecond = p;
+            }
+            lastDown = !doubleClick && pressed != 0 && (canShrink || isClient) ? now : 0;
+            lastWasCaption = canShrink; lastWasClient = isClient && !claimed;
+            lastDownPoint = p; lastDownTarget = pressed;
             if (!claimed) return Native.CallNextHookEx(mouseHook, code, wp, lp);
             // A press on the focused window's title bar arms a move of it. The press is
             // swallowed so the app never starts its own drag; a press that never moves is
@@ -112,6 +132,11 @@ public sealed class InputHooks : IDisposable
             return 1;
         }
         // WM_LBUTTONUP
+        if (pendingClient != 0)
+        {
+            var target = pendingClient; pendingClient = 0;
+            ClientDoubleClick?.Invoke(target, pendingFirst, pendingSecond, GestureVersion);
+        }
         if (!dragArmed) return Native.CallNextHookEx(mouseHook, code, wp, lp);
         dragArmed = false;
         if (dragging) { dragging = false; WindowDragged?.Invoke(dragTarget); return 1; }
@@ -121,11 +146,12 @@ public sealed class InputHooks : IDisposable
     // Arm a move of the window under the cursor, if the press landed on its title bar.
     // It must be a real top-level window of another process (never our own overlay or a
     // shell surface) and either the browsed window or the current foreground one.
-    // `pressed` is the browsed/foreground window under the pointer even when the press is
-    // not claimed (content), so the caller can still detect a double-click on it.
-    bool TryArmDrag(Native.POINT p, out nint pressed)
+    // Native hit testing determines whether a press may participate in a shrink gesture.
+    bool TryArmDrag(Native.POINT p, out nint pressed, out bool canShrink, out bool isClient)
     {
         pressed = 0;
+        canShrink = false;
+        isClient = false;
         var target = Native.GetAncestor(Native.WindowFromPoint(p), 2); // GA_ROOT
         if (target == 0) return false;
         Native.GetWindowThreadProcessId(target, out var pid);
@@ -146,44 +172,35 @@ public sealed class InputHooks : IDisposable
         }
         pressed = target;
         if (!Native.GetWindowRect(target, out var r)) return false;
-        // Only the window's own title bar/top strip belongs to StayView for DRAGGING. A
-        // press on the resize frame or ordinary content is left to Windows/the app unless
-        // it completes the separate double-click-to-shrink gesture handled by the caller.
-        // Holding Win turns the whole window into a drag handle, so custom-chrome apps
-        // (Chrome, Electron) that report their title bar as client area can still be moved
-        // from anywhere. Without the modifier only the real title bar (HTCAPTION) is a
-        // StayView move, and the resize frame and content are left to the app.
+        // A positive client hit belongs to the app, even in the top strip: that strip
+        // can contain tabs, buttons or editable text. Win+drag is the explicit override.
         bool winHeld = winKeyDown || Native.GetAsyncKeyState(0x5B) < 0 || Native.GetAsyncKeyState(0x5C) < 0;
         var hit = HitTest(target, p, r);
-        // The top strip of the focused window is a drag handle, even when the app draws its
-        // own title bar there and reports it as client area (Chrome, Electron). A press on
-        // Content is claimed only inside that band and only becomes a move once the pointer
-        // passes the drag threshold; a plain click is replayed to the app, so tabs and
-        // toolbar buttons in the strip keep working. The very top edge stays Frame (resize).
-        uint dpi = Native.GetDpiForWindow(target); if (dpi == 0) dpi = 96;
-        int band = (int)Math.Round(44.0 * dpi / 96);
-        bool inTopBand = hit == Hit.Content && p.Y - r.Top >= 0 && p.Y - r.Top < band;
-        // Holding Win extends that to anywhere on the window, for dragging below the strip.
-        bool claim = winHeld || hit == Hit.Caption || inTopBand;
+        bool fallbackCaption = hit == null && InFallbackCaption(p, r);
+        isClient = hit == 1;
+        canShrink = FocusedClickPolicy.CanShrink(hit, fallbackCaption);
+        // Let Windows own ordinary caption drags, snap, restore-under-pointer and capture.
+        // Only the explicit Win+drag gesture needs synthetic window movement.
+        bool claim = winHeld && FocusedClickPolicy.CanDrag(hit, winHeld, false);
         if (!claim) return false;
         dragTarget = target; dragStart = p; dragOrigin = r; dragArmed = true; dragging = false; dragLogged = false;
         return true;
     }
-    enum Hit { Content, Caption, Frame }
     // Ask the window itself (WM_NCHITTEST) so each app's real chrome is respected, with a
     // short timeout so a hung app cannot stall the mouse hook. HTGROWBOX and the eight
     // border/corner codes are the resize frame; HTCAPTION is the title bar.
-    static Hit HitTest(nint h, Native.POINT p, Native.RECT r)
+    static int? HitTest(nint h, Native.POINT p, Native.RECT r)
     {
         nint packed = (nint)(((uint)(p.Y & 0xFFFF) << 16) | (uint)(p.X & 0xFFFF));
         // SMTO_ABORTIFHUNG | SMTO_BLOCK, 30 ms so a genuinely hung app cannot stall the hook.
         if (Native.SendMessageTimeout(h, 0x0084, 0, packed, 0x0002 | 0x0001, 30, out var hit) != 0)
         {
-            long code = hit.ToInt64();
-            // The window answered: trust its own non-client hit-test exactly.
-            if (code == 2) return Hit.Caption;
-            return code == 4 || (code >= 10 && code <= 17) ? Hit.Frame : Hit.Content;
+            return (int)hit.ToInt64();
         }
+        return null; // Uncertain hit tests must never swallow an app double-click.
+    }
+    static bool InFallbackCaption(Native.POINT p, Native.RECT r)
+    {
         // No answer in 30 ms. A busy console (conhost running output) is regularly flagged
         // "hung" by SMTO_ABORTIFHUNG, so this path is common, not rare — the old code fell
         // straight to the resize-frame geometry and NEVER returned Caption, which is why a
@@ -195,9 +212,7 @@ public sealed class InputHooks : IDisposable
         int caption = Math.Max(1, Native.GetSystemMetrics(4)); // SM_CYCAPTION
         bool edge = p.X - r.Left < border || r.Right - p.X <= border
             || p.Y - r.Top < border || r.Bottom - p.Y <= border;
-        if (edge) return Hit.Frame;
-        if (p.Y - r.Top < border + caption) return Hit.Caption;
-        return Hit.Content;
+        return !edge && p.Y - r.Top < border + caption;
     }
     static bool PointInsideWindow(nint h, Native.POINT p)
     {
@@ -226,6 +241,7 @@ public sealed class InputHooks : IDisposable
         if (code < 0) return Native.CallNextHookEx(hook, code, wp, lp);
         int key = Marshal.ReadInt32(lp);
         bool down = wp == 0x100 || wp == 0x104, up = wp == 0x101 || wp == 0x105;
+        if (down) { GestureVersion++; lastDown = 0; pendingClient = 0; }
         // Track the Win key here (this hook sees every key up/down) so the mouse hook has
         // an authoritative held-state for Win+drag. GetAsyncKeyState proved unreliable
         // when queried from inside the mouse hook.

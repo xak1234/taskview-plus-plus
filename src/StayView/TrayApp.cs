@@ -12,6 +12,7 @@ sealed class TrayApp
     readonly OverlayChrome primary;
     readonly Dictionary<nint, OverlayChrome> overlays = [];
     readonly InputHooks input;
+    readonly EmptySpaceProbe emptySpace = new();
     readonly TrayIcon tray;
     readonly DispatcherQueue queue;
     readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(500) };
@@ -20,15 +21,44 @@ sealed class TrayApp
     // While browsing, a clicked window sits in front of the overview. The overlays have
     // dropped topmost; the timer and foreground events must not yank them back on top.
     bool browsing;
+    readonly HashSet<nint> nativeGestures = [];
+    // Windows currently going through a user-initiated native minimize while browsed.
+    // MINIMIZESTART is early enough to put StayView's DWM shrink in front of the shell's
+    // taskbar animation; MINIMIZEEND then journals the real iconic state.
+    readonly HashSet<nint> overviewMinimizing = [];
+    Dictionary<nint,Native.RECT> WindowBounds(IEnumerable<nint> windows)
+    {
+        var bounds=new Dictionary<nint,Native.RECT>();
+        foreach(var h in windows)
+        {
+            if(!Native.IsWindow(h))continue;
+            // Animate to the visible DWM frame, not USER32's larger invisible resize
+            // rectangle. Otherwise the miniature reaches one rectangle and the real
+            // focused window appears a few pixels away, which reads as a final jump.
+            if(!Native.IsIconic(h) && Native.TryGetVisualBounds(h,out var r)) { bounds[h]=r; continue; }
+            // Once Windows has completed a minimize, GetWindowRect is no longer the real
+            // on-screen rectangle. The placement journal deliberately retains the last
+            // visible bounds, so use those as the animation origin. This lets the DWM
+            // miniature shrink from the window's former focused position without ever
+            // restoring/flashing the real HWND just to obtain geometry.
+            if(session.Placements.Entries.TryGetValue(h,out var saved))bounds[h]=saved.Bounds;
+        }
+        return bounds;
+    }
+    void CancelAnimations() { foreach(var chrome in overlays.Values) chrome.CancelWindowAnimation(); }
+    void CommitAnimations() { foreach(var chrome in overlays.Values) chrome.CommitWindowAnimation(); }
+    Task AnimateWindowsAsync(IReadOnlyDictionary<nint,Native.RECT> bounds,bool expanding)
+        => Task.WhenAll(overlays.Values.Select(c=>c.AnimateWindowsAsync(bounds,expanding)));
     // The windows currently browsed in front of the grid, primary (session.Selected /
     // foreground) first, at most two. A third promotion demotes the oldest back under the
     // canvas so its tile reappears.
     readonly List<nint> browsed = new();
     int MaxBrowsed => Math.Clamp(settings.MaxBrowsedWindows, Settings.MaxBrowsedWindowsMin, Settings.MaxBrowsedWindowsMax);
+    bool CanBrowse(nint h) => Native.IsWindow(h) && Native.IsWindowVisible(h) && !Native.IsIconic(h) && desktops.IsCurrent(h);
     void Promote(nint h)
     {
         browsed.Remove(h); browsed.Insert(0, h);
-        browsed.RemoveAll(b => b != h && (!Native.IsWindow(b) || !desktops.IsCurrent(b)));
+        browsed.RemoveAll(b => b != h && !CanBrowse(b));
         var demoted = browsed.Skip(MaxBrowsed).ToList();
         if (demoted.Count > 0) browsed.RemoveRange(MaxBrowsed, browsed.Count - MaxBrowsed);
         foreach (var chrome in overlays.Values) chrome.SetBrowsed(browsed);
@@ -38,17 +68,27 @@ sealed class TrayApp
     // Settings lowered the cap while more windows were browsed: demote the oldest extras.
     void TrimBrowsed() { if (browsing && browsed.Count > MaxBrowsed && browsed.Count > 0) Promote(browsed[0]); }
     // Send one browsed window back under the canvas, keeping the other in front (and focused).
-    void Demote(nint h)
+    async void Demote(nint h)
     {
+        if(!session.Active || !browsed.Contains(h))return;
+        if(browsed.Count==1){ReturnToGrid();return;}
+        int version=++activationVersion;
+        activating=true;
+        CancelAnimations();
+        var animation=AnimateWindowsAsync(WindowBounds(new[]{h}),false);
         browsed.Remove(h);
         var keep = browsed.FirstOrDefault();
-        if (keep == 0) { ReturnToGrid(); return; }
         // Push the demoted window under the canvas first so it can never sit over the kept
         // one, then hand focus to the kept window (EnterBrowsing retries; on failure it
         // falls back to the grid itself).
         Native.SetWindowPos(h, 1, 0, 0, 0, 0, 0x13); // HWND_BOTTOM
         foreach (var chrome in overlays.Values) chrome.SetBrowsed(browsed);
-        EnterBrowsing(keep);
+        try { await animation; }
+        finally
+        {
+            if(version==activationVersion)
+            { CancelAnimations(); activating=false; if(session.Active)EnterBrowsing(keep); }
+        }
     }
     bool activating;
     int activationVersion;
@@ -63,10 +103,65 @@ sealed class TrayApp
         input.IsActive = () => session.Active;
         // Left-drag on the focused window's title bar moves it; keep the moved placement.
         input.BrowsedWindow = () => session.Selected;
-        input.WindowDragged += h => queue.TryEnqueue(() => session.NoteUserMoved(h));
+        input.WindowDragged += h => queue.TryEnqueue(async () => {
+            // Win+drag posts cross-thread moves. Let the last posted move reach the app
+            // before capturing it; native caption moves use EVENT_SYSTEM_MOVESIZEEND below.
+            await Task.Delay(80);
+            if(session.Active && !input.IsDragging && CanBrowse(h))session.NoteUserMoved(h);
+        });
+        catalog.MoveSizeChanged += (h,started) => queue.TryEnqueue(() => {
+            if(started)
+            {
+                if(session.Active && browsed.Contains(h))
+                {
+                    nativeGestures.Add(h);
+                    foreach(var chrome in overlays.Values)chrome.ReassertBrowseZOrder();
+                }
+            }
+            else if(nativeGestures.Remove(h) && session.Active)
+            {
+                session.NoteUserMoved(h);
+                foreach(var chrome in overlays.Values)chrome.ReassertBrowseZOrder();
+            }
+        });
+        catalog.MinimizeChanged += (h,started) => queue.TryEnqueue(() => {
+            if(!session.Active || h==0 || !Native.IsWindow(h))
+            { overviewMinimizing.Remove(h); return; }
+            if(started)
+            {
+                if(!browsing || !browsed.Contains(h) || !overviewMinimizing.Add(h))return;
+                // Start the registered-thumbnail journey while the real HWND still has its
+                // last visible bounds, then put that HWND behind the overview. Windows may
+                // continue its native minimize internally, but its taskbar-bound animation
+                // is covered by StayView rather than shown to the user.
+                if(browsed.Count>1)Demote(h);
+                else ReturnToGrid();
+                return;
+            }
+            if(!overviewMinimizing.Remove(h))return;
+            if(Native.IsIconic(h))session.NoteUserMinimized(h);
+            // Refresh persistent adornments immediately. In particular, if this source was
+            // still rendered with an old dock role, its frame disappears in this same turn
+            // instead of waiting for a later topology reflow/timer tick.
+            foreach(var chrome in overlays.Values)chrome.PruneDeadTiles();
+        });
         input.Toggle += () => queue.TryEnqueue(HotkeyToggle);
-        // Double-clicking anywhere on a browsed window shrinks it back to the grid. This is
-        // an intentional gesture: the second click is consumed even when it lands in app content.
+        input.ClientDoubleClick += (h, first, second, gesture) => queue.TryEnqueue(async () =>
+        {
+            int version = activationVersion;
+            if (!browsing || !session.Active || !browsed.Contains(h)) return;
+            if (!await emptySpace.IsEmptyAsync(h, first, second)) return;
+            // Never apply a delayed provider result after the user has moved on.
+            if (version != activationVersion || gesture != input.GestureVersion
+                || !browsing || !session.Active || !browsed.Contains(h) || !CanBrowse(h)) return;
+            if (!Native.GetCursorPos(out var cursor)
+                || Math.Abs(cursor.X - second.X) >= 6 || Math.Abs(cursor.Y - second.Y) >= 6) return;
+            var foreground = Native.GetForegroundWindow();
+            if (foreground != h && Native.GetAncestor(foreground, 3) != h) return;
+            Demote(h);
+        });
+        // Only confirmed title-bar double-clicks shrink a browsed window. Content and
+        // control double-clicks are passed through by InputHooks.
         input.DoubleClick += h => queue.TryEnqueue(() => {
             if (!session.Active || !browsing) return;
             // With two windows browsed, only the double-clicked one shrinks back; the other
@@ -105,17 +200,17 @@ sealed class TrayApp
             signature = TopologySignature();
         };
         session.DesktopRemoved += id => { if(popout?.DesktopId==id)ClosePopout(); };
-        session.Leaving += () => { activationVersion++; activating=false; ClosePopout(); CloseOptions(); browsing = false; browsed.Clear(); input.Browsing = false; input.SetOverview(false); foreach (var chrome in overlays.Values) chrome.Hide(); signature = ""; };
+        session.Leaving += () => { activationVersion++; activating=false; CancelAnimations(); nativeGestures.Clear(); overviewMinimizing.Clear(); ClosePopout(); CloseOptions(); browsing = false; ClearBrowsed(); input.Browsing = false; input.SetOverview(false); foreach (var chrome in overlays.Values) chrome.Hide(); signature = ""; };
         // A desktop switch while browsing ends the browse: the focused window is on the
         // desktop we left. Clear the flags only — the switch's own reflow renders the new
         // grid, and with browsedSource cleared that render re-asserts the overview topmost.
         session.DesktopSwitched += () => {
             SyncPopoutForDesktop();
-            if(browsing)
-            {
-                browsing = false; input.Browsing = false; activating = false; activationVersion++;
-                ClearBrowsed();
-            }
+            // A first activation can still be retrying before browsing becomes true.
+            // Invalidate it on every desktop switch, even in that pre-commit state.
+            browsing = false; input.Browsing = false; activating = false; activationVersion++;
+            CancelAnimations(); nativeGestures.Clear(); overviewMinimizing.Clear();
+            ClearBrowsed();
         };
         catalog.ForegroundChanged += () => queue.TryEnqueue(() => {
             if(!session.Active || activating) return;
@@ -140,7 +235,16 @@ sealed class TrayApp
             foreach (var chrome in overlays.Values) chrome.PruneDeadTiles();
             // Runs while browsing, which is exactly when the focused window is being
             // moved, resized, maximized or snapped by the user.
-            if (browsing) { foreach (var b in browsed.ToList()) session.SyncUserGeometry(b); ReconcileBrowse(); }
+            if (browsing)
+            {
+                foreach (var b in browsed.Where(b=>!nativeGestures.Contains(b)).ToList()) session.SyncUserGeometry(b);
+                // ReconcileBrowse deliberately leaves active pointer/native move gestures
+                // alone. Maintain only browse z-order during that pause so a focused
+                // window cannot sit hidden behind the overview until release.
+                if(session.DragActive || input.IsDragging || nativeGestures.Count!=0 || overlays.Values.Any(c => c.IsDragging))
+                    foreach(var chrome in overlays.Values)chrome.ReassertBrowseZOrder();
+                ReconcileBrowse();
+            }
             if (browsing || activating || session.DragActive || overlays.Values.Any(c => c.IsDragging) || popout?.IsInteracting == true) return;
             try {
                 // A window minimized while the grid is open can lose its DWM pixels and
@@ -168,6 +272,20 @@ sealed class TrayApp
     {
         chrome.FloatingPanel = popout?.Handle ?? 0;
         chrome.TileActivated += h => queue.TryEnqueue(() => EnterBrowsing(h));
+        chrome.InteractionStarted += () => {
+            if(activating)
+            {
+                activationVersion++; activating=false; CancelAnimations();
+                // A new press supersedes the old transition; keep the current browse visible.
+                foreach(var overlay in overlays.Values)overlay.SetBrowsed(browsed);
+            }
+            if(browsing && session.Active)
+                foreach(var overlay in overlays.Values)overlay.ReassertBrowseZOrder();
+        };
+        chrome.TileDragStarted += () => {
+            if(browsing && session.Active)
+                foreach(var overlay in overlays.Values)overlay.ReassertBrowseZOrder();
+        };
         chrome.TileClose += h => queue.TryEnqueue(() => session.Close(h));
         chrome.TileDragMoved += (h,p) => {
             var target = popout;
@@ -305,22 +423,41 @@ sealed class TrayApp
     // resident; the hotkey re-summons the grid.
     async void EnterBrowsing(nint h)
     {
-        if (!session.Active || h==0 || !Native.IsWindow(h)) return;
+        if (!session.Active || h==0 || !Native.IsWindow(h) || !desktops.IsCurrent(h)) return;
         int version=++activationVersion;
         activating=true;
+        // A NEW focus animation captures the target miniature's current visual position
+        // itself, so don't finish an in-flight layout transition here first: doing so was
+        // the dock -> canvas -> focus two-journey bug. Re-fronting an already browsed window
+        // has no new visual journey and may safely settle any unrelated layout transition.
+        if(browsed.Contains(h))CancelAnimations();
         // The overview must stop being topmost before SetForegroundWindow can succeed,
         // but don't commit browsing/suppression until activation has actually succeeded.
         try
         {
+            if(!browsed.Contains(h))
+            {
+                // A miniature drag is the one overview gesture allowed to change the real
+                // desktop location. Apply that saved target while the canvas is still
+                // covering the HWND, then measure the actual DWM frame for a snap-free
+                // expansion. A normal focus click performs no geometry change.
+                session.PrepareActivationGeometry(h);
+                await AnimateWindowsAsync(WindowBounds(new[]{h}),true);
+            }
+            if(version!=activationVersion || !session.Active || !Native.IsWindow(h) || !desktops.IsCurrent(h))return;
             foreach (var chrome in overlays.Values) chrome.DropTopmost();
             for(int attempt=0;attempt<10;attempt++)
             {
                 if(version!=activationVersion || !session.Active)return;
-                if(!Native.IsWindow(h))break;
+                if(!Native.IsWindow(h) || !desktops.IsCurrent(h))break;
                 if(session.Activate(h))
                 {
                     browsing=true;
                     input.Browsing=true;
+                    // The DWM miniature has reached the real window rectangle. Keep it
+                    // there for the handoff instead of CancelAnimations snapping it back
+                    // to the small tile for one frame just as the real HWND appears.
+                    CommitAnimations();
                     Promote(h);
                     return;
                 }
@@ -335,8 +472,10 @@ sealed class TrayApp
             if(version==activationVersion)
             {
                 activating=false;
+                CancelAnimations();
                 if(session.Active && !browsing)
                     { ClearBrowsed(); foreach(var chrome in overlays.Values) chrome.RaiseTopmost(); }
+                else if(session.Active)foreach(var chrome in overlays.Values)chrome.SetBrowsed(browsed);
             }
         }
     }
@@ -356,14 +495,31 @@ sealed class TrayApp
     void ReconcileBrowse()
     {
         if(!browsing || !session.Active || activating) return;
-        if(session.DragActive || overlays.Values.Any(c => c.IsDragging)) return; // never interrupt a gesture
+        if(session.DragActive || input.IsDragging || nativeGestures.Count!=0 || overlays.Values.Any(c => c.IsDragging)) return; // never interrupt a gesture
+        var minimized=browsed.Where(Native.IsIconic).ToList();
+        foreach(var h in minimized)session.NoteUserMinimized(h);
+        if(minimized.Count>0)
+        {
+            // Animate the already-registered DWM miniature from the last real window
+            // rectangle down into its remembered tile BEFORE any reflow can snap the tile
+            // straight to its small position. The real HWND remains genuinely minimized,
+            // so this restores the visual transition without reintroducing the flash.
+            if(minimized.Count==browsed.Count) { ReturnToGrid(); return; }
+            Demote(minimized[0]); return;
+        }
+        var available = BrowseReconciler.AvailableWindows(browsed, CanBrowse);
+        if (!browsed.SequenceEqual(available))
+        {
+            browsed.Clear(); browsed.AddRange(available);
+            foreach (var chrome in overlays.Values) chrome.SetBrowsed(browsed);
+        }
         // The browsed window left the current desktop (a switch by either StayView or
         // Windows): show the new desktop's grid rather than auto-browsing whatever is here.
-        if(session.Selected == 0 || !Native.IsWindow(session.Selected) || !desktops.IsCurrent(session.Selected))
+        if(session.Selected == 0 || !browsed.Contains(session.Selected))
         {
             // Primary is gone (closed / moved desktop). If the second browsed window is still
             // here, it carries on alone rather than dropping both to the grid.
-            var survivor = browsed.FirstOrDefault(b => b != session.Selected && Native.IsWindow(b) && desktops.IsCurrent(b));
+            var survivor = browsed.FirstOrDefault();
             browsed.Remove(session.Selected);
             if(survivor != 0) { EnterBrowsing(survivor); return; }
             ReturnToGrid(); return;
@@ -384,6 +540,8 @@ sealed class TrayApp
         var target = ownCanvas ? 0 : catalog.Enumerate().FirstOrDefault(w => w.Handle == fg || w.Handle == root)?.Handle ?? 0;
         switch(BrowseReconciler.ClassifyForeground(session.Selected, fg, root, ownCanvas, target))
         {
+            case BrowseTarget.Keep:
+                return;
             case BrowseTarget.Refront:
                 // A tile press makes the overview the foreground window. Now that a tile
                 // press no longer ends the browse, the browse is still live — put the
@@ -402,10 +560,16 @@ sealed class TrayApp
     // makes it the foreground window, which puts the opaque canvas over the browsed
     // window — so if the browsed tile stayed suppressed the window vanished from both
     // places at once. Back-on-the-grid is the only honest state after that click.
-    void ReturnToGrid()
+    async void ReturnToGrid()
     {
+        // Invalidate any asynchronous activation before publishing the grid state.
+        int version=++activationVersion;
+        CancelAnimations();
+        var bounds=WindowBounds(browsed);
+        activating = true;
         browsing = false;
         input.Browsing = false;
+        var animation=AnimateWindowsAsync(bounds,false);
         // Restore the miniatures first so there is no one-frame hole when the browsed
         // real windows are sent back.
         ClearBrowsed();
@@ -413,17 +577,34 @@ sealed class TrayApp
         // SetWindowPos on the overview while the pointer is captured can cancel the
         // gesture, and the gesture's own end (drop/dock/undock/activate) reflows anyway,
         // which re-asserts the grid's z-order now that browsedSource is cleared.
-        if (overlays.Values.Any(c => c.IsDragging)) return;
-        foreach (var chrome in overlays.Values) chrome.RaiseTopmost();
-        popout?.BringToFront();
-        session.Reflow();
+        try
+        {
+            if (!overlays.Values.Any(c => c.IsDragging))
+            {
+                foreach (var chrome in overlays.Values) chrome.RaiseTopmost();
+                popout?.BringToFront();
+            }
+            await animation;
+        }
+        finally
+        {
+            if(version==activationVersion)
+            {
+                CancelAnimations(); activating=false;
+                if(session.Active && !overlays.Values.Any(c=>c.IsDragging))session.Reflow();
+            }
+        }
     }
     string TopologySignature()
     {
         // Enumerate resolves the current desktop id for this pass; reuse it via
         // LastCurrent instead of a second broker round-trip for desktops.Current.
         var handles = catalog.Enumerate().Select(w => w.Handle.ToInt64()).OrderBy(h => h);
-        return catalog.LastCurrent + "|" + string.Join("|", handles);
+        // Docked windows can live on other virtual desktops now, so include their live
+        // handles too. A foreign dock source closing must invalidate the layout even when
+        // the current desktop's ordinary window set did not otherwise change.
+        var docked = session.DockedSources.Where(Native.IsWindow).Select(h => h.ToInt64()).OrderBy(h => h);
+        return catalog.LastCurrent + "|" + string.Join("|", handles) + "|D:" + string.Join(",", docked);
     }
     void ShowOptions(nint owner=0)
     {

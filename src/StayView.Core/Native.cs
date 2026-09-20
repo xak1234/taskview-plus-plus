@@ -1,4 +1,4 @@
-﻿using System.Runtime.InteropServices;
+using System.Runtime.InteropServices;
 using System.Text;
 namespace StayView.Core;
 public static class Native
@@ -69,6 +69,7 @@ public static class Native
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool GetMonitorInfo(nint h,ref MONITORINFO info);
     [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(nint hdc,nint clip,MonitorProc cb,nint data);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(nint h);
+    [DllImport("user32.dll")] public static extern nint SetThreadDpiAwarenessContext(nint context);
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(nint monitor,int type,out uint x,out uint y);
     public static double MonitorScale(nint monitor) => GetDpiForMonitor(monitor,0,out var dpi,out _)==0 ? Math.Max(1,dpi/96d) : 1;
     [DllImport("user32.dll")] public static extern nint SetWinEventHook(uint min,uint max,nint module,WinEventProc cb,uint pid,uint thread,uint flags);
@@ -87,6 +88,7 @@ public static class Native
     [DllImport("user32.dll")] public static extern int SetWindowRgn(nint h,nint region,bool redraw);
     [DllImport("user32.dll")] public static extern nint CallWindowProc(nint prev,nint h,uint msg,nint wp,nint lp);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(nint h,uint attr,out int value,int size);
+    [DllImport("dwmapi.dll",EntryPoint="DwmGetWindowAttribute")] static extern int DwmGetWindowAttributeRect(nint h,uint attr,out RECT value,int size);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(nint h,uint attr,ref uint value,int size);
     [DllImport("dwmapi.dll")] public static extern int DwmQueryThumbnailSourceSize(nint thumb,out POINT size);
     [DllImport("user32.dll")] public static extern bool GetClientRect(nint h,out RECT rect);
@@ -102,6 +104,16 @@ public static class Native
     public static string Title(nint h) {var s=new StringBuilder(1024);GetWindowText(h,s,s.Capacity);return s.ToString();}
     public static string Class(nint h) {var s=new StringBuilder(256);GetClassName(h,s,s.Capacity);return s.ToString();}
     public static WINDOWPLACEMENT Placement(nint h) {var p=new WINDOWPLACEMENT{Length=Marshal.SizeOf<WINDOWPLACEMENT>()};GetWindowPlacement(h,ref p);return p;}
+    // GetWindowRect includes the invisible resize border on many Windows 10/11 windows.
+    // DWM thumbnails, and the pixels the user actually sees when the real HWND takes over,
+    // line up with DWMWA_EXTENDED_FRAME_BOUNDS instead. Using the USER32 rectangle as a
+    // focus-animation endpoint therefore leaves a small but very visible final snap.
+    public static bool TryGetVisualBounds(nint h,out RECT r)
+    {
+        if(DwmGetWindowAttributeRect(h,9,out r,Marshal.SizeOf<RECT>())==0 && r.Width>0 && r.Height>0)
+            return true; // DWMWA_EXTENDED_FRAME_BOUNDS
+        return GetWindowRect(h,out r) && r.Width>0 && r.Height>0;
+    }
     public static void DisableDwmBorder(nint h) {
         // DWMWA_BORDER_COLOR + DWMWA_COLOR_NONE removes Windows 11's thin native
         // outline around otherwise-borderless StayView windows.

@@ -7,3 +7,7 @@ release/
 artifacts/
 *.zip
 *.log
+*.bak
+*.bak-*
+*.tmp
+SESSION-UPDATES.md

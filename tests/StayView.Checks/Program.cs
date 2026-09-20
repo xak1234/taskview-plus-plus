@@ -6,7 +6,7 @@ if(args.Length>0&&args[0]=="stayview-windows"){
     int z=0;
     Native.EnumWindows((h,_)=>{
         int order=z++;
-        if(Native.Title(h).StartsWith("StayView")){
+        if(Native.Title(h).StartsWith("StayView") || Native.Title(h)=="Taskview++"){
             Native.GetWindowRect(h,out var rect);
             Console.WriteLine(JsonSerializer.Serialize(new{Handle=h.ToInt64(),Title=Native.Title(h),Visible=Native.IsWindowVisible(h),Topmost=(Native.GetWindowLongPtr(h,-20).ToInt64()&8)!=0,Z=order,Bounds=rect},options));
         }
@@ -14,6 +14,33 @@ if(args.Length>0&&args[0]=="stayview-windows"){
     },0);return;
 }
 if(args.Length>0&&args[0]=="fixtures"){Fixtures.Run();return;}
+if(args.Length>0&&args[0]=="interaction-checks"){await InteractionChecks.Run();return;}
+if(args.Length>0&&args[0]=="empty-space-checks"){await Fixtures.CheckEmptySpace();return;}
+if(args.Length>0&&args[0]=="probe-point"){
+    Native.GetCursorPos(out var point);
+    if(args.Length>2){point.X=int.Parse(args[1]);point.Y=int.Parse(args[2]);}
+    var window=Native.GetAncestor(Native.WindowFromPoint(point),2);
+    Native.GetWindowThreadProcessId(window,out var pid);
+    Console.WriteLine($"POINT {point.X},{point.Y} root={window} pid={pid} class={Native.Class(window)}");
+    var element=System.Windows.Automation.AutomationElement.FromPoint(new System.Windows.Point(point.X,point.Y));
+    for(int depth=0;element!=null&&depth<96;depth++){
+        var info=element.Current;
+        Console.WriteLine($"{depth}: {info.ControlType.ProgrammaticName} pid={info.ProcessId} hwnd={info.NativeWindowHandle} bounds={info.BoundingRectangle} focusable={info.IsKeyboardFocusable} named={!string.IsNullOrWhiteSpace(info.Name)} patterns={string.Join(',',element.GetSupportedPatterns().Select(p=>p.Id))}");
+        if(element.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern,out var pattern)){
+            if(element.TryGetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern,out var vp))Console.WriteLine($"  valueReadonly={((System.Windows.Automation.ValuePattern)vp).Current.IsReadOnly}");
+            var text=(System.Windows.Automation.TextPattern)pattern;
+            var range=text.RangeFromPoint(new System.Windows.Point(point.X,point.Y));
+            range.ExpandToEnclosingUnit(System.Windows.Automation.Text.TextUnit.Character);
+            Console.WriteLine($"  readonly={range.GetAttributeValue(System.Windows.Automation.TextPattern.IsReadOnlyAttribute)} charBounds={string.Join(',',range.GetBoundingRectangles())}");
+        }
+        if((nint)info.NativeWindowHandle==window)break;
+        element=System.Windows.Automation.TreeWalker.RawViewWalker.GetParent(element);
+    }
+    var watch=System.Diagnostics.Stopwatch.StartNew();
+    var probe=new EmptySpaceProbe();
+    Console.WriteLine($"EMPTY={await probe.IsEmptyAsync(window,point,point)} reason={probe.LastDecision} elapsed={watch.ElapsedMilliseconds}ms");
+    return;
+}
 if(args.Length>0&&args[0]=="capture-journal"){File.Copy(PlacementStore.Journal,args[1],true);Console.WriteLine("Saved entry placements for independent exit/crash comparison.");return;}
 if(args.Length>0&&args[0]=="verify-journal"){
     var saved=JsonSerializer.Deserialize<List<SavedPlacement>>(File.ReadAllText(args[1]),options)!;int fail=0;
@@ -22,7 +49,7 @@ if(args.Length>0&&args[0]=="verify-journal"){
         Console.WriteLine((pass?"PASS":"FAIL")+" original placement: "+Native.Title(h));if(!pass){fail++;Console.WriteLine(JsonSerializer.Serialize(new{expected=s.Placement,actual,expectedBounds=s.Bounds,bounds},options));}
     }Environment.ExitCode=fail>0?1:0;return;
 }
-if(args.Length>0&&args[0]=="toggle"){Native.EnumWindows((h,_)=>{if(Native.Title(h)=="StayView"){Native.PostMessage(h,0x312,1,0);return false;}return true;},0);return;}
+if(args.Length>0&&args[0]=="toggle"){Native.EnumWindows((h,_)=>{if(Native.Title(h) is "StayView" or "Taskview++"){Native.PostMessage(h,0x312,1,0);return false;}return true;},0);return;}
 if(args.Length>0&&args[0]=="diagnostics"){Console.WriteLine(File.ReadAllText(Path.Combine(Settings.Folder,"stayview.log")).Split('\n').TakeLast(12).Aggregate("",(a,b)=>a+b+"\n"));return;}
 if(args.Length>1&&args[0]=="--desktop-broker"){DesktopBroker.Run(args[1]);return;}
 if(args.Length>0&&args[0]=="desktops"){var service=new VirtualDesktopService();Console.WriteLine(JsonSerializer.Serialize(service.List(),options));return;}
@@ -209,8 +236,61 @@ Console.WriteLine($"PASS: {checks} legacy grid scenarios plus top/bottom strip r
         throw new Exception("Another managed source taking focus must be followed");
     if(BrowseReconciler.ClassifyForeground(selected,300,300,false,0)!=BrowseTarget.Grid)
         throw new Exception("An untiled window taking focus must return to the grid");
-    if(BrowseReconciler.ClassifyForeground(selected,0,0,false,0)!=BrowseTarget.Grid)
-        throw new Exception("No foreground at all must return to the grid");
+    if(BrowseReconciler.ClassifyForeground(selected,0,0,false,0)!=BrowseTarget.Keep)
+        throw new Exception("Transient no-foreground handoff must keep the browse");
     Console.WriteLine("PASS: browse reconciliation keeps, re-fronts, follows and grids the right foreground.");
+    // A secondary can disappear while primary focus remains unchanged. Both slots must
+    // be reconciled before the foreground fast path, preserving survivor order.
+    nint[] pair = [100, 200];
+    foreach (var unavailable in pair)
+    {
+        var survivors = BrowseReconciler.AvailableWindows(pair, h => h != unavailable);
+        if (!survivors.SequenceEqual(pair.Where(h => h != unavailable)))
+            throw new Exception("Unavailable primary or secondary remained browsed");
+    }
+    if (BrowseReconciler.AvailableWindows(pair, _ => false).Count != 0)
+        throw new Exception("No available windows must resolve to the grid");
+    if (!BrowseReconciler.AvailableWindows(new nint[] { 200, 100, 200, 0 }, _ => true).SequenceEqual(new nint[] { 200, 100 }))
+        throw new Exception("Browse reconciliation changed focus order or retained duplicate/zero handles");
+    Console.WriteLine("PASS: unavailable primary and secondary windows release browse state in focus order.");
 }
+// Native hit codes: client, caption, system menu, resize frame, caption buttons,
+// unknown/timeout. Only an actual caption can consume a double-click.
+foreach (int? hit in new int?[] { null, -2, -1, 0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21 })
+{
+    if (FocusedClickPolicy.CanShrink(hit)) throw new Exception("App content/control double-click was claimed as shrink");
+    if (hit != null && FocusedClickPolicy.CanDrag(hit, false, true)) throw new Exception("Top-strip fallback stole a confirmed app/control hit");
+    if (hit != null && hit != 1 && FocusedClickPolicy.CanDrag(hit, true, true)) throw new Exception("Win modifier stole a native control/resize action");
+}
+if (!FocusedClickPolicy.CanShrink(2) || !FocusedClickPolicy.CanDrag(2, false, false)) throw new Exception("Confirmed caption lost its overview gestures");
+if (!FocusedClickPolicy.CanShrink(null, true) || FocusedClickPolicy.CanShrink(1, true)) throw new Exception("Caption timeout fallback must work only when native hit testing is unknown");
+if (!FocusedClickPolicy.CanDrag(1, true, false) || FocusedClickPolicy.CanDrag(1, false, true)) throw new Exception("Client drag must require Win, including custom top strips");
+if (!FocusedClickPolicy.CanDrag(null, false, true) || FocusedClickPolicy.CanDrag(null, false, false)) throw new Exception("Timed-out hit test lost conservative caption drag fallback");
+Console.WriteLine("PASS: intelligent clicks preserve content, tabs, caption buttons and resizing; confirmed or safe timeout-caption hits shrink.");
+foreach (var id in new[] { 50008, 50023, 50026, 50028, 50036, 50032, 50033 })
+    if (!FocusedClickPolicy.IsBackgroundContainer(id)) throw new Exception("Empty container cannot toggle focus");
+foreach (var id in new[] { 50000, 50003, 50004, 50005, 50007, 50020, 50024, 50025, 50030 })
+    if (FocusedClickPolicy.IsBackgroundContainer(id)) throw new Exception("Button, text, document or item was considered empty");
+foreach (var id in new[] { 10000, 10002, 10003, 10005, 10010, 10014, 10015, 10024 })
+    if (!FocusedClickPolicy.IsInteractivePattern(id)) throw new Exception("Interactive container pattern must protect app content");
+Console.WriteLine("PASS: empty container backgrounds are eligible; text, files, controls and interactive containers are protected.");
+if(!FocusedClickPolicy.IsOutsideText(50,50,new double[]{100,100,20,20}))throw new Exception("Whitespace near text must be eligible");
+if(FocusedClickPolicy.IsOutsideText(110,110,new double[]{100,100,20,20}))throw new Exception("Text character must remain native");
+if(FocusedClickPolicy.IsOutsideText(120,120,new double[]{100,100,20,20}))throw new Exception("Text boundary must remain native");
+if(FocusedClickPolicy.IsOutsideText(50,50,new double[]{0,0,10,10,40,40,20,20}))throw new Exception("All text rectangles must be checked");
+if(FocusedClickPolicy.IsOutsideText(0,0,new double[]{double.NaN,0,1,1}) || FocusedClickPolicy.IsOutsideText(0,0,new double[]{1}))throw new Exception("Unknown text geometry must stay native");
+Console.WriteLine("PASS: browser whitespace is distinguished from actual text rectangles and malformed geometry.");
+var pageBounds=new System.Windows.Rect(100,200,1000,700);
+if(!FocusedClickPolicy.IsPageSizedHandler(pageBounds,pageBounds)
+    || FocusedClickPolicy.IsPageSizedHandler(new System.Windows.Rect(100,200,100,50),pageBounds)
+    || FocusedClickPolicy.IsPageSizedHandler(System.Windows.Rect.Empty,pageBounds))throw new Exception("Only page-sized delegated handlers may count as whitespace");
+var stableArea=new Native.RECT(-1200,240,1200,800);
+var occupiedTiles=new[]{new Native.RECT(-1000,400,400,240),new Native.RECT(-560,400,400,240)};
+var originalTiles=occupiedTiles.ToArray();
+var newcomer=StableTileLayout.PlaceNew(occupiedTiles[0],occupiedTiles,stableArea,28);
+if(!occupiedTiles.SequenceEqual(originalTiles))throw new Exception("Adding a window moved an existing tile");
+if(occupiedTiles.Any(r=>r.Intersects(newcomer)))throw new Exception("New window covered a remembered tile despite free space");
+if(newcomer.Left<stableArea.Left || newcomer.Top<stableArea.Top || newcomer.Right>stableArea.Right || newcomer.Bottom>stableArea.Bottom)throw new Exception("New tile escaped negative-coordinate canvas");
+if(!StableTileLayout.PlaceNew(occupiedTiles[0],[],stableArea,28).Equals(occupiedTiles[0]))throw new Exception("Unoccupied tile position changed");
+Console.WriteLine("PASS: new windows use free canvas space without changing remembered tile positions.");
 record CheckState(long Handle,string Title,Native.RECT Bounds,Native.WINDOWPLACEMENT Placement);

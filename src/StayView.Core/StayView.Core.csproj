@@ -1,1 +1,1 @@
-<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup></Project>
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup><ItemGroup><FrameworkReference Include="Microsoft.WindowsDesktop.App.WPF" /></ItemGroup></Project>

@@ -11,10 +11,12 @@ namespace StayView;
 
 sealed class OverlayChrome : Window
 {
+    const uint ReassertBrowseZOrderMessage = 0x8002;
     readonly Grid root = new();
     readonly Border backdropLayer = new(){IsHitTestVisible=false};
     readonly Border stripBar = new(){IsHitTestVisible=false,CornerRadius=new CornerRadius(12),BorderThickness=new Thickness(1)};
     readonly Canvas canvas = new();
+    readonly Canvas adornmentLayer = new(){IsHitTestVisible=false};
     readonly OverviewSession session;
     readonly Settings settings;
     readonly Action<nint> showOptions;
@@ -31,6 +33,7 @@ sealed class OverlayChrome : Window
     Native.RECT work;
     double scale = 1;
     bool pinned;
+    bool surfaceReady;
     string pictureSignature = "";
     int transitionVersionSeen;
     public nint Handle { get; }
@@ -48,6 +51,8 @@ sealed class OverlayChrome : Window
     // A left press on empty overview canvas (no tile hit) — used to return to the grid
     // while browsing, without stealing presses that land on a tile (so tiles stay draggable).
     public event Action? BackgroundPressed;
+    public event Action? InteractionStarted;
+    public event Action? TileDragStarted;
     public Func<nint, Native.POINT, bool>? ExternalTileDrop { get => tilesView.ExternalDrop; set => tilesView.ExternalDrop = value; }
     // A desktop card was double-clicked: pop that desktop out (with the work rect for placement).
     public event Action<DesktopInfo, Native.RECT>? DesktopPopoutRequested;
@@ -67,7 +72,7 @@ sealed class OverlayChrome : Window
         Title = "Taskview++";
         canvas.RequestedTheme = ElementTheme.Dark;
         canvas.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-        root.Children.Add(backdropLayer);root.Children.Add(canvas);Content = root;
+        root.Children.Add(backdropLayer);root.Children.Add(canvas);root.Children.Add(adornmentLayer);Content = root;
         Handle = WinRT.Interop.WindowNative.GetWindowHandle(this);
         Native.DisableDwmScreenFrame(Handle);
         presenter = (OverlappedPresenter)AppWindow.Presenter;
@@ -77,6 +82,10 @@ sealed class OverlayChrome : Window
         // SetBorderAndTitleBar(false,false) still leaves a classic dialog-frame style on
         // some Windows App SDK builds. Remove those native frame bits while still hidden.
         Native.MakeOverviewTrueBorderless(Handle);
+        // The overview is permanently full-surface. Clear any native region once while
+        // hidden; repeating SetWindowRgn during every reflow invalidates the HWND and can
+        // expose a raw/black background frame while the compositor catches up.
+        Native.SetWindowRgn(Handle, 0, false);
         // Cosmetic only. Some Windows App SDK / shell combinations return
         // E_NOTIMPL here even though the HWND already has WS_EX_TOOLWINDOW.
         // Never let that optional switcher hint prevent StayView from starting.
@@ -85,10 +94,12 @@ sealed class OverlayChrome : Window
         Native.SetWindowLongPtr(Handle, -20, (nint)(Native.GetWindowLongPtr(Handle, -20).ToInt64() | 0x80));
         procedure = WndProc;
         originalProc = Native.SetWindowLongPtr(Handle, -4, Marshal.GetFunctionPointerForDelegate(procedure));
-        tilesView = new DockView(Handle, canvas, session, settings);
+        tilesView = new DockView(Handle, canvas, adornmentLayer, session, settings);
         tilesView.DockHover += over => stripBar.BorderBrush = over ? GlassAppearance.ActiveBrush() : GlassAppearance.StripEdgeBrush();
         tilesView.TileActivated += h => TileActivated?.Invoke(h);
         tilesView.BackgroundPressed += () => BackgroundPressed?.Invoke();
+        tilesView.InteractionStarted += () => InteractionStarted?.Invoke();
+        tilesView.TileDragStarted += () => TileDragStarted?.Invoke();
         tilesView.TileClose += h => TileClose?.Invoke(h);
         tilesView.TileDragMoved += (h,p) => TileDragMoved?.Invoke(h,p);
         tilesView.TileDragEnded += () => TileDragEnded?.Invoke();
@@ -101,18 +112,39 @@ sealed class OverlayChrome : Window
         if (TrayIcon.HandleOwnerDraw(msg,lp,out var menuResult)) return menuResult;
         if (msg == 0x312) { ToggleRequested?.Invoke(); return 0; }
         if (msg == 0x8001) { TrayMessage?.Invoke((int)(lp.ToInt64() & 0xffff)); return 0; }
+        if (msg == ReassertBrowseZOrderMessage) { KeepBelowBrowsed(); return 0; }
         if(msg is 0x201 or 0x204 or 0x207)OverviewPointerDown?.Invoke();
-        if (msg == 0x21) return 3; // MA_NOACTIVATE: clicking a thumbnail may focus its source.
+        if (msg == 0x21)
+        {
+            // MA_NOACTIVATE stops the native click activation, but WinUI's island can still
+            // finish a focus/activation handoff after this callback. Reassert the browse
+            // z-order on the next message-loop turn, after that handoff has settled.
+            if (browsed.Count != 0) Native.PostMessage(h, ReassertBrowseZOrderMessage, 0, 0);
+            return 3;
+        }
         // WM_ACTIVATE while browsing: MA_NOACTIVATE only stops the click itself. WinUI's
         // island still focuses (and so activates) this HWND on a tile press, and activation
         // raises the opaque canvas over the browsed window whose tile is suppressed — the
         // "focused window vanishes when you drag another tile" bug. Put the canvas straight
         // back underneath the browsed window; the reconciler re-focuses it after the gesture.
-        if (msg == 0x06 && (wp.ToInt64() & 0xffff) != 0) KeepBelowBrowsed();
+        if (msg == 0x06 && (wp.ToInt64() & 0xffff) != 0)
+        {
+            KeepBelowBrowsed();
+            // Doing this only inside WM_ACTIVATE is racy: Windows/WinUI may complete the
+            // activation after our SetWindowPos and raise the opaque canvas again. The
+            // posted pass is authoritative once activation has actually completed.
+            Native.PostMessage(h, ReassertBrowseZOrderMessage, 0, 0);
+        }
         if (msg == 0x14)
         {
-            Native.GetClientRect(h, out var r);
-            Native.FillRect(wp, ref r, Native.GetStockObject(4)); // Solid black even before XAML paints.
+            // Before the first XAML frame exists, give USER32 a deterministic dark surface.
+            // Once composition is live, report the erase handled WITHOUT repainting black:
+            // click/move/reflow invalidations otherwise flash this GDI fill through acrylic.
+            if (!surfaceReady)
+            {
+                Native.GetClientRect(h, out var r);
+                Native.FillRect(wp, ref r, Native.GetStockObject(4));
+            }
             return 1;
         }
         return Native.CallWindowProc(originalProc, h, msg, wp, lp);
@@ -120,13 +152,12 @@ sealed class OverlayChrome : Window
     public void Render(nint monitor, IReadOnlyList<Tile> tiles, string hotkey)
     {
         if (IsDragging) return;
-        work = Native.WorkArea(monitor);
-        AppWindow.MoveAndResize(new RectInt32(work.Left, work.Top, work.Width, work.Height));
+        var nextWork = Native.WorkArea(monitor);
+        bool geometryChanged = !work.Equals(nextWork);
+        work = nextWork;
+        if (geometryChanged)
+            AppWindow.MoveAndResize(new RectInt32(work.Left, work.Top, work.Width, work.Height));
         scale = Math.Max(1, Native.GetDpiForWindow(Handle) / 96d);
-        // One full work-area surface only. Never use a cut-out region: moving a
-        // thumbnail must not expose a raw-desktop hole beneath it.
-        Native.SetWindowRgn(Handle, 0, true);
-        tilesView.Clear();
         // Deliberately NOT ClearDesktopThumbnails() here. The desktop-card previews are DWM
         // registrations against this HWND, not XAML children, so they survive the canvas
         // rebuild below. Tearing all of them down on every reflow and re-registering them
@@ -136,8 +167,8 @@ sealed class OverlayChrome : Window
         pictureSignature = "";
         canvas.Children.Clear();
         canvas.Width = work.Width / scale; canvas.Height = work.Height / scale;
+        adornmentLayer.Width=canvas.Width;adornmentLayer.Height=canvas.Height;
         backdropLayer.Width=canvas.Width;backdropLayer.Height=canvas.Height;
-        ApplyAppearance();
         BuildDesktopStrip();
         var options = new Button { Content = "⚙", Width=36, Height=32, Padding=new Thickness(0),
             Background = GlassAppearance.SurfaceBrush2(settings.GlassOpacity), Foreground = GlassAppearance.PrimaryBrush(),
@@ -150,10 +181,15 @@ sealed class OverlayChrome : Window
         transitionVersionSeen=session.DesktopTransitionVersion;
         tilesView.Render(tiles, work, scale, transition);
         root.UpdateLayout();
-        AppWindow.Show(false);
-        // WinUI may rewrite presenter styles during Show. Reassert the real borderless
-        // HWND state, not just DWM colouring, so no 1 px perimeter survives.
-        Native.MakeOverviewTrueBorderless(Handle);
+        surfaceReady = true;
+        if (!Native.IsWindowVisible(Handle))
+        {
+            AppWindow.Show(false);
+            // WinUI may rewrite presenter styles during an actual Show. Reassert the real
+            // borderless HWND state only then; doing frame/style work on every tile reflow
+            // needlessly invalidates the full desktop-sized surface.
+            Native.MakeOverviewTrueBorderless(Handle);
+        }
         if (!pinned) pinned = session.Desktops.PinOwnWindow(Handle);
         if (browsed.Count == 0)
         {
@@ -192,11 +228,21 @@ sealed class OverlayChrome : Window
     // Up to two windows browsed in front of this overview, primary (foreground) first.
     readonly List<nint> browsed = new();
     public void SetBrowsedSource(nint source) => SetBrowsed(source == 0 ? Array.Empty<nint>() : new[] { source });
+    public Task AnimateWindowsAsync(IReadOnlyDictionary<nint, Native.RECT> bounds, bool expanding)
+        => tilesView.AnimateWindowsAsync(bounds, expanding);
+    public void CancelWindowAnimation() => tilesView.CancelWindowAnimation();
+    public void CommitWindowAnimation() => tilesView.CommitWindowAnimation();
     public void SetBrowsed(IReadOnlyList<nint> sources)
     {
         browsed.Clear(); browsed.AddRange(sources.Where(s => s != 0).Distinct().Take(Settings.MaxBrowsedWindowsMax));
         tilesView.SetSuppressed(browsed);
         KeepBelowBrowsed();
+    }
+    public void ReassertBrowseZOrder()
+    {
+        if (browsed.Count == 0 || !Native.IsWindowVisible(Handle)) return;
+        KeepBelowBrowsed();
+        Native.PostMessage(Handle, ReassertBrowseZOrderMessage, 0, 0);
     }
     // Enforce primary > secondary > canvas in the z-order without changing activation.
     // Idempotent; a no-op when the grid is up.
@@ -455,6 +501,6 @@ sealed class OverlayChrome : Window
     // Drop tiles whose source window has closed, so no clickable ghost is left behind.
     public void PruneDeadTiles() => tilesView.PruneDead();
     public void ApplyRegion() { } // No holes, ever.
-    public void Hide() { tilesView.SuppressSource(0); tilesView.Clear(); ClearDesktopThumbnails(); AppWindow.Hide(); }
+    public void Hide() { browsed.Clear(); tilesView.SetSuppressed(browsed); tilesView.Clear(); ClearDesktopThumbnails(); AppWindow.Hide(); }
     void Add(UIElement element, double x, double y) { Canvas.SetLeft(element, x); Canvas.SetTop(element, y); canvas.Children.Add(element); }
 }

@@ -48,6 +48,34 @@ public sealed class PlacementStore
         saved[h]=replacement;
         Persist();
     }
+    public void MarkMinimized(nint h)
+    {
+        if(!saved.TryGetValue(h,out var entry) || !Native.IsIconic(h))return;
+        var placement=new Native.WINDOWPLACEMENT{Length=System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>()};
+        if(!Native.GetWindowPlacement(h,ref placement))return;
+        // Retain the last on-screen bounds; GetWindowRect on an iconic window is a sentinel.
+        entry.Placement=placement;
+        Persist();
+    }
+    // Moving an overview miniature is an explicit user placement change. Translate the
+    // saved real-window rectangle by the same screen-space delta while preserving size,
+    // show state, z-order and desktop. The real HWND is deliberately not touched here:
+    // OverviewSession applies this target while the opaque overview still covers it, or
+    // Restore() applies it on dismissal. That prevents a hidden source from flashing.
+    public bool Translate(nint h,int dx,int dy)
+    {
+        if((dx==0&&dy==0)||!saved.TryGetValue(h,out var entry))return false;
+        static Native.RECT Shift(Native.RECT r,int x,int y)
+            => new(r.Left+x,r.Top+y,r.Width,r.Height);
+        entry.Bounds=Shift(entry.Bounds,dx,dy);
+        var p=entry.Placement;
+        p.NormalPosition=Shift(p.NormalPosition,dx,dy);
+        entry.Placement=p;
+        var target=entry.Bounds;
+        entry.Monitor=Native.MonitorFromRect(ref target,2);
+        Persist();
+        return true;
+    }
     // A deliberate virtual-desktop move is user state, not temporary overview state.
     // Update only the desktop id so geometry/show-state still restore exactly as captured.
     public void SetDesktop(nint h, Guid desktopId) {
