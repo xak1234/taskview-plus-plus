@@ -9,7 +9,7 @@ using Windows.Graphics;
 
 namespace StayView;
 
-// A double-clicked virtual desktop popped out as its own borderless, always-on-top
+// A right-clicked virtual desktop popped out as its own borderless, always-on-top
 // window: a live scaled copy (wallpaper + DWM thumbnails of that desktop's windows)
 // that can be dragged by its header, resized by the corner grip, and whose windows can
 // be clicked to jump to that desktop. The thumbnails are visual copies (not embedded
@@ -37,6 +37,11 @@ sealed class DesktopPopoutWindow : Window
     string contentSig = "";
     bool suspended;
     bool pinned;
+    // The popout is a view of the monitor it was created from, not whichever monitor
+    // the floating panel happens to be sitting on now. Re-resolving the source monitor
+    // from Handle while dragging the panel across a monitor boundary made every source
+    // window on the original monitor fail Snapshot's intersection test and disappear.
+    Native.RECT sourceScreen;
     // 0 = none, 1 = move (header), 2 = resize (grip)
     int gestureMode;
     uint gesturePointer;
@@ -155,6 +160,9 @@ sealed class DesktopPopoutWindow : Window
 
     public void Present(Native.RECT work)
     {
+        var sourceProbe=work;
+        var sourceMonitor=Native.MonitorFromRect(ref sourceProbe,2);
+        sourceScreen=sourceMonitor!=0?Native.MonitorBounds(sourceMonitor):work;
         scale = Math.Max(1, Native.GetDpiForWindow(Handle) / 96d);
         var (minW,maxW,minH,maxH)=ResizeBounds(work);
         int w = Math.Clamp((int)Math.Round(work.Width * DefaultWorkAreaFraction), minW, maxW);
@@ -264,7 +272,7 @@ sealed class DesktopPopoutWindow : Window
             // panel pixels back into desktop pixels and move the real HWND without
             // activating or re-ordering it. Its existing DWM registration is then moved
             // directly, avoiding a full popout rebuild on every pointer sample.
-            var screen = Native.MonitorBounds(Native.MonitorFromWindow(Handle, 2));
+            var screen = SourceScreen();
             var content = PopoutContentRect();
             int realDx = (int)Math.Round(dx * screen.Width / (double)Math.Max(1, content.Width));
             int realDy = (int)Math.Round(dy * screen.Height / (double)Math.Max(1, content.Height));
@@ -424,7 +432,7 @@ sealed class DesktopPopoutWindow : Window
 
     List<(nint Handle, Native.RECT Bounds)> Snapshot()
     {
-        var screen = Native.MonitorBounds(Native.MonitorFromWindow(Handle, 2));
+        var screen = SourceScreen();
         return DesktopWindows().Select(h => (Handle: h, Bounds: Native.GetWindowRect(h, out var r) ? r : default))
             .Where(w => w.Bounds.Width > 0 && w.Bounds.Height > 0 && w.Bounds.Intersects(screen)).ToList();
     }
@@ -436,7 +444,7 @@ sealed class DesktopPopoutWindow : Window
         windowRects.Clear();
         var live = new HashSet<nint>();
         var content = PopoutContentRect();
-        var screen = Native.MonitorBounds(Native.MonitorFromWindow(Handle, 2));
+        var screen = SourceScreen();
         // Back-to-front so overlapping windows composite in the right order.
         foreach (var w in windows.AsEnumerable().Reverse())
         {
@@ -469,10 +477,16 @@ sealed class DesktopPopoutWindow : Window
     {
         if (!thumbBySource.TryGetValue(h, out var thumb)) return;
         var content = PopoutContentRect();
-        var screen = Native.MonitorBounds(Native.MonitorFromWindow(Handle, 2));
+        var screen = SourceScreen();
         if (!TryPositionWindowThumb(h, thumb, source, content, screen, out var clip)) return;
         int i = windowRects.FindIndex(x => x.Handle == h);
         if (i >= 0) windowRects[i] = (h, clip); else windowRects.Add((h, clip));
+    }
+    Native.RECT SourceScreen()
+    {
+        if(sourceScreen.Width>0&&sourceScreen.Height>0)return sourceScreen;
+        var monitor=Native.MonitorFromWindow(Handle,2);
+        return monitor!=0?Native.MonitorBounds(monitor):new Native.RECT(0,0,1,1);
     }
     static bool TryPositionWindowThumb(nint h, nint thumb, Native.RECT source, Native.RECT content, Native.RECT screen, out Native.RECT clip)
     {

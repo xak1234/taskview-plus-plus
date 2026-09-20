@@ -315,12 +315,22 @@ sealed class OverlayChrome : Window
             AutomationPropertiesName(card, desktop.Name);
             var target = desktop;
             if(target.Id!=Guid.Empty)desktopCards[target.Id]=card;
-            // Single click switches after the double-click window; this lets a second click
-            // cancel the switch and open the desktop popout instead.
-            card.Tapped += (_, _) => { if (target.Current || target.Id == session.Desktops.Current) return; pendingSwitch = target.Id; switchTimer.Stop(); switchTimer.Start(); };
-            // Double click pops out alternate desktops only; the current one would nest the overview.
-            card.DoubleTapped += (_, _) => { switchTimer.Stop(); pendingSwitch = Guid.Empty; if (!target.Current) DesktopPopoutRequested?.Invoke(target, work); };
-            if (session.Desktops.Available && target.Id != Guid.Empty)
+            // With popout moved to right-click, a normal left click can switch immediately;
+            // there is no longer a double-click interval to wait through.
+            card.Tapped += (_, _) => {
+                switchTimer.Stop();pendingSwitch=Guid.Empty;
+                if (target.Current || target.Id == session.Desktops.Current) return;
+                session.ChangeDesktop(() => session.Desktops.Switch(target.Id));
+            };
+            // Right-click is now the direct popout gesture for an alternate desktop.
+            // Mark it handled so WinUI does not also open the old context flyout.
+            card.RightTapped += (_, e) => {
+                switchTimer.Stop();pendingSwitch=Guid.Empty;
+                if (!target.Current && target.Id != session.Desktops.Current)
+                { e.Handled=true; DesktopPopoutRequested?.Invoke(target, work); }
+            };
+            // The current desktop cannot be popped out, so retain its management menu.
+            if (session.Desktops.Available && target.Id != Guid.Empty && target.Current)
                 card.ContextFlyout = DesktopMenu(target,desktopIndex,desktops.Count);
             Add(card, left, cardTop);
             // Tiny uppercase monospace (terminal) label under/over each desktop card.

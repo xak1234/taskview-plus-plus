@@ -13,7 +13,12 @@ public sealed class InputHooks : IDisposable
     // hook watch the focused window. Title bars shrink directly; client double-clicks
     // are checked asynchronously for empty background. Controls keep their native input.
     bool browsing;
-    public bool Browsing { get => browsing; set { if(browsing!=value){lastDown=0; GestureVersion++; pendingClient=0;} browsing = value; if (!value) { dragArmed = false; dragging = false; } } }
+    public bool Browsing { get => browsing; set {
+        if(browsing!=value){lastDown=0; GestureVersion++; pendingClient=0;}
+        if(!value && dragArmed && dragButton==2) swallowRightRelease=true;
+        browsing = value;
+        if (!value) { dragArmed = false; dragging = false; dragButton=0; }
+    } }
     public long GestureVersion { get; private set; }
     bool lastWasCaption, lastWasClient;
     nint pendingClient;
@@ -34,6 +39,11 @@ public sealed class InputHooks : IDisposable
     Native.POINT dragStart;
     Native.RECT dragOrigin;
     bool dragArmed, dragging, dragLogged;
+    // 1 = explicit Win+left drag, 2 = right-button hold drag. Right-drag deliberately
+    // ignores the child HWND under the pointer so a focused host can still be moved while
+    // the cursor is over an embedded app owned by another process.
+    int dragButton;
+    bool swallowRightRelease;
     public event Action? Escape;
     public event Action? Toggle;
     public event Action<nint>? DoubleClick; // the browsed/foreground window that was double-clicked
@@ -56,6 +66,7 @@ public sealed class InputHooks : IDisposable
         // The overview may have reopened between the second down and its up.
         // Consume the matching release even after browsing was disabled.
         if(msg==0x202 && swallowRelease){swallowRelease=false;return 1;}
+        if(msg==0x205 && swallowRightRelease){swallowRightRelease=false;return 1;}
         if(!browsing)return Native.CallNextHookEx(mouseHook, code, wp, lp);
         if (msg is 0x204 or 0x207 or 0x20B or 0x20A or 0x20E)
         { GestureVersion++; lastDown = 0; pendingClient = 0; }
@@ -98,6 +109,24 @@ public sealed class InputHooks : IDisposable
             // Blocking the button-down already stops the app from starting its own drag.
             return Native.CallNextHookEx(mouseHook, code, wp, lp);
         }
+        if(msg==0x204) // WM_RBUTTONDOWN
+        {
+            GestureVersion++;lastDown=0;pendingClient=0;
+            if(!TryArmRightDrag(mouse.Point))
+                return Native.CallNextHookEx(mouseHook,code,wp,lp);
+            // Suppress the app's right-down while the gesture is undecided. If the pointer
+            // never moves past the drag threshold, replay a normal right click on release.
+            return 1;
+        }
+        if(msg==0x205) // WM_RBUTTONUP
+        {
+            if(!dragArmed||dragButton!=2)
+                return Native.CallNextHookEx(mouseHook,code,wp,lp);
+            dragArmed=false;dragButton=0;
+            if(dragging){dragging=false;WindowDragged?.Invoke(dragTarget);return 1;}
+            ReplayClick(true);
+            return 1;
+        }
         if (msg != 0x201 && msg != 0x202) return Native.CallNextHookEx(mouseHook, code, wp, lp);
         if (msg == 0x201) // WM_LBUTTONDOWN
         {
@@ -112,7 +141,7 @@ public sealed class InputHooks : IDisposable
             bool doubleClick = pressed != 0 && lastDown != 0 && lastDownTarget == pressed && now - lastDown <= dt && Math.Abs(p.X - lastDownPoint.X) <= tolX && Math.Abs(p.Y - lastDownPoint.Y) <= tolY;
             if (canShrink && lastWasCaption && doubleClick)
             {
-                lastDown = 0; dragArmed = false; dragging = false;
+                lastDown = 0; dragArmed = false; dragging = false; dragButton=0;
                 swallowRelease = true;
                 DoubleClick?.Invoke(pressed); return 1;
             }
@@ -137,10 +166,10 @@ public sealed class InputHooks : IDisposable
             var target = pendingClient; pendingClient = 0;
             ClientDoubleClick?.Invoke(target, pendingFirst, pendingSecond, GestureVersion);
         }
-        if (!dragArmed) return Native.CallNextHookEx(mouseHook, code, wp, lp);
-        dragArmed = false;
+        if (!dragArmed || dragButton!=1) return Native.CallNextHookEx(mouseHook, code, wp, lp);
+        dragArmed = false;dragButton=0;
         if (dragging) { dragging = false; WindowDragged?.Invoke(dragTarget); return 1; }
-        ReplayClick();
+        ReplayClick(false);
         return 1;
     }
     // Arm a move of the window under the cursor, if the press landed on its title bar.
@@ -183,7 +212,25 @@ public sealed class InputHooks : IDisposable
         // Only the explicit Win+drag gesture needs synthetic window movement.
         bool claim = winHeld && FocusedClickPolicy.CanDrag(hit, winHeld, false);
         if (!claim) return false;
-        dragTarget = target; dragStart = p; dragOrigin = r; dragArmed = true; dragging = false; dragLogged = false;
+        dragTarget = target; dragStart = p; dragOrigin = r; dragArmed = true; dragging = false; dragLogged = false;dragButton=1;
+        return true;
+    }
+    bool TryArmRightDrag(Native.POINT p)
+    {
+        var target=BrowsedWindow?.Invoke()??0;
+        var foreground=Native.GetForegroundWindow();
+        bool selectedFocused=target!=0&&(foreground==target||Native.GetAncestor(foreground,3)==target);
+        if(!selectedFocused||!Native.IsWindow(target)||Native.IsIconic(target)||!PointInsideWindow(target,p))
+        {
+            // Fall back to the foreground root only when it is a real external window.
+            target=foreground;
+            if(target!=0)target=Native.GetAncestor(target,2);
+            if(target==0||!Native.IsWindow(target)||Native.IsIconic(target)||!PointInsideWindow(target,p))return false;
+            Native.GetWindowThreadProcessId(target,out var pid);
+            if(pid==Environment.ProcessId)return false;
+        }
+        if(!Native.GetWindowRect(target,out var r))return false;
+        dragTarget=target;dragStart=p;dragOrigin=r;dragArmed=true;dragging=false;dragLogged=false;dragButton=2;
         return true;
     }
     // Ask the window itself (WM_NCHITTEST) so each app's real chrome is respected, with a
@@ -221,11 +268,11 @@ public sealed class InputHooks : IDisposable
     }
     // The press was a click, not a drag: send it on so the app still receives it. The
     // sentinel keeps this hook from treating the replay as a fresh press.
-    static void ReplayClick()
+    static void ReplayClick(bool right)
     {
         var inputs = new Native.INPUT[2];
-        inputs[0].Type = 0; inputs[0].Mouse = new Native.MOUSEINPUT { DwFlags = 0x0002, ExtraInfo = DragSentinel };
-        inputs[1].Type = 0; inputs[1].Mouse = new Native.MOUSEINPUT { DwFlags = 0x0004, ExtraInfo = DragSentinel };
+        inputs[0].Type = 0; inputs[0].Mouse = new Native.MOUSEINPUT { DwFlags = right?0x0008u:0x0002u, ExtraInfo = DragSentinel };
+        inputs[1].Type = 0; inputs[1].Mouse = new Native.MOUSEINPUT { DwFlags = right?0x0010u:0x0004u, ExtraInfo = DragSentinel };
         Native.SendInput(2, inputs, Marshal.SizeOf<Native.INPUT>());
     }
     public void Register(Settings settings)
