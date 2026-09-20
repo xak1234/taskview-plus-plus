@@ -216,6 +216,7 @@ public sealed class OverviewSession : IDisposable
     }
     void RestoreMinimizedSourcesForOverview(IEnumerable<AppWindow> windows)
     {
+        ConfirmUserMinimizedSources();
         foreach (var w in windows)
             if (w.Minimized || Native.IsIconic(w.Handle)) RestoreMinimizedSourceForOverview(w.Handle);
     }
@@ -362,8 +363,10 @@ public sealed class OverviewSession : IDisposable
         // passive overview-thumbnail keepalive path must continue using no-activate restore.
         if (Native.IsIconic(h))
         {
-            Native.PostMessage(h, 0x112, (nint)0xF120, 0); // WM_SYSCOMMAND / SC_RESTORE
-            Native.ShowWindowAsync(h, 9);                 // conventional fallback
+            if(Native.SendMessageTimeout(h,0x112,(nint)0xF120,0,0x2,120,out _)==0)
+                Native.PostMessage(h, 0x112, (nint)0xF120, 0);
+            Native.ShowWindowAsync(h, 9);
+            if(Native.IsIconic(h))return false;
         }
         // Lift off the bottom of the z-order (overview keeps sources lowered) and focus.
         // A denied z-order request (e.g. an elevated console) must not prevent the
@@ -420,6 +423,23 @@ public sealed class OverviewSession : IDisposable
         if(!Native.SetWindowPos(h,0,saved.Bounds.Left,saved.Bounds.Top,0,0,0x15))
             Log.Write($"Tile placement move failed for {h}: {System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
     }
+    // Reserve user-minimize intent as soon as Windows announces MINIMIZESTART. The native
+    // minimize has not necessarily reached WS_MINIMIZE yet, so do not touch the journal's
+    // ShowCmd here. This early marker exists to block the grid's passive DWM keepalive from
+    // restoring the HWND in the gap before EVENT_SYSTEM_MINIMIZEEND arrives.
+    public void BeginUserMinimize(nint h)
+    {
+        if(!Active || h==0 || !Native.IsWindow(h))return;
+        userMinimized.Add(h);
+        docked.Remove(h);
+    }
+    public void CancelUserMinimize(nint h)
+    {
+        if(!Active || Native.IsIconic(h))return;
+        if(userMinimized.Remove(h) && Placements.Entries.TryGetValue(h,out var saved)
+            && saved.Placement.ShowCmd is 2 or 6 or 7)
+            Placements.Recapture(h);
+    }
     public void NoteUserMinimized(nint h)
     {
         if(!Active || !Native.IsIconic(h))return;
@@ -430,6 +450,23 @@ public sealed class OverviewSession : IDisposable
         // can re-summon the overview with its tile in the normal canvas. The dock-minimized
         // setting applies only to windows that were already minimized when the session opened.
         docked.Remove(h);
+    }
+    // EVENT_SYSTEM_MINIMIZEEND is advisory rather than a transaction boundary: on some
+    // windows it can arrive late (or not at all) after the HWND is already iconic. Confirm
+    // reserved user-minimize intent from the normal grid maintenance path too. The show
+    // state write is idempotent and only performed when the journal has not yet recorded a
+    // minimized ShowCmd, so this does not turn the 500 ms timer into a disk-write loop.
+    public void ConfirmUserMinimizedSources()
+    {
+        if(!Active)return;
+        foreach(var h in userMinimized.ToList())
+        {
+            if(!Native.IsWindow(h)){userMinimized.Remove(h);continue;}
+            if(!Native.IsIconic(h))continue;
+            if(Placements.Entries.TryGetValue(h,out var saved)
+                && saved.Placement.ShowCmd is not (2 or 6 or 7))
+                Placements.MarkMinimized(h);
+        }
     }
     // A user RESIZE of the focused window is theirs to keep (edge/corner drag, maximize,
     // Windows snap) — the input hook can't see it, since resize-frame presses pass through

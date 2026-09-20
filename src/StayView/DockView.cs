@@ -33,6 +33,11 @@ sealed class DockView : IDisposable
     // Blue frames drawn just outside docked thumbnails. Keep one XAML object per source
     // on a persistent adornment layer so unrelated reflows do not tear the frame down.
     readonly Dictionary<nint, Border> dockBorders = [];
+    // Browsed real windows sit above this full-screen overlay. Their outline is therefore
+    // drawn just OUTSIDE the real DWM frame on this persistent layer: the real window hides
+    // the inner edge while the ring remains visible around it. The actual foreground window
+    // gets a substantially thicker ring than the other browsed window.
+    readonly Dictionary<nint, Border> browseBorders = [];
     readonly DispatcherTimer transitionTimer = new() { Interval = TimeSpan.FromMilliseconds(16) };
     readonly DispatcherTimer transitionDelayTimer = new() { Interval = TimeSpan.FromMilliseconds(55) };
     readonly Dictionary<nint, Native.RECT> transitionStarts = [];
@@ -248,6 +253,30 @@ sealed class DockView : IDisposable
         suppressed.Clear(); suppressed.UnionWith(next);
         RefreshDockBorders();
     }
+    // Keep hidden browse thumbnails parked at the real HWND rectangle. If z-order ever
+    // becomes unsafe, OverlayChrome can reveal the thumbnail immediately and it occupies
+    // the same pixels rather than falling back to an old small-tile location.
+    void UpdateBrowsedVisuals(IReadOnlyList<nint> sources)
+    {
+        foreach(var source in sources)
+        {
+            if(Native.IsIconic(source)||!Native.TryGetVisualBounds(source,out var real)||!real.Intersects(work))continue;
+            var item=items.FirstOrDefault(i=>i.Source==source);
+            if(item!=null)PositionRect(item,real,PositionWriter.Layout);
+        }
+    }
+    public void SetBrowsePresentation(IReadOnlyList<nint> orderedSources,IReadOnlyList<nint> suppressibleSources,nint focusedSource)
+    {
+        UpdateBrowsedVisuals(orderedSources);
+        SetSuppressed(suppressibleSources);
+        UpdateBrowseBorders(orderedSources,focusedSource);
+    }
+    public void ShowBrowseFallback(IReadOnlyList<nint> orderedSources,nint focusedSource)
+    {
+        UpdateBrowsedVisuals(orderedSources);
+        SetSuppressed(Array.Empty<nint>());
+        UpdateBrowseBorders(orderedSources,focusedSource);
+    }
     void SetSourceVisible(nint source,bool visible)
     {
         var item=items.FirstOrDefault(i=>i.Source==source);
@@ -373,6 +402,45 @@ sealed class DockView : IDisposable
     {
         if(!dockBorders.Remove(source,out var frame))return;
         adornmentCanvas.Children.Remove(frame);
+    }
+    void UpdateBrowseBorders(IReadOnlyList<nint> sources,nint focusedSource)
+    {
+        var wanted=sources.Where(s=>s!=0&&Native.IsWindow(s)).ToHashSet();
+        foreach(var stale in browseBorders.Keys.Where(s=>!wanted.Contains(s)).ToList())
+        {
+            adornmentCanvas.Children.Remove(browseBorders[stale]);
+            browseBorders.Remove(stale);
+        }
+        foreach(var source in wanted)
+        {
+            if(Native.IsIconic(source)||!Native.IsWindowVisible(source)||
+               !Native.TryGetVisualBounds(source,out var real)||!real.Intersects(work))
+            {
+                if(browseBorders.TryGetValue(source,out var hidden))hidden.Visibility=Visibility.Collapsed;
+                continue;
+            }
+            bool focused=source==focusedSource;
+            double thickness=focused?6:2;
+            double gap=1;
+            double inset=gap+thickness;
+            if(!browseBorders.TryGetValue(source,out var frame))
+            {
+                frame=new Border {
+                    Background=new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                    IsHitTestVisible=false,
+                    CornerRadius=new CornerRadius(4) };
+                Canvas.SetZIndex(frame,60);
+                adornmentCanvas.Children.Add(frame);
+                browseBorders[source]=frame;
+            }
+            frame.BorderThickness=new Thickness(thickness);
+            frame.BorderBrush=focused?GlassAppearance.ActiveBrush():GlassAppearance.EdgeBrush();
+            frame.Width=Math.Max(1,real.Width/scale+2*inset);
+            frame.Height=Math.Max(1,real.Height/scale+2*inset);
+            Canvas.SetLeft(frame,(real.Left-work.Left)/scale-inset);
+            Canvas.SetTop(frame,(real.Top-work.Top)/scale-inset);
+            frame.Visibility=Visibility.Visible;
+        }
     }
     void UpdateHover(Native.POINT p)
     {
@@ -638,6 +706,11 @@ sealed class DockView : IDisposable
         }
         RefreshDockBorders();
         suppressed.RemoveWhere(s=>!Native.IsWindow(s));
+        foreach(var source in browseBorders.Keys.Where(s=>!Native.IsWindow(s)).ToList())
+        {
+            adornmentCanvas.Children.Remove(browseBorders[source]);
+            browseBorders.Remove(source);
+        }
         bool removed = false;
         for (int i = items.Count - 1; i >= 0; i--)
         {
@@ -669,6 +742,8 @@ sealed class DockView : IDisposable
         items.Clear();
         foreach (var b in dockBorders.Values) adornmentCanvas.Children.Remove(b);
         dockBorders.Clear();
+        foreach (var b in browseBorders.Values) adornmentCanvas.Children.Remove(b);
+        browseBorders.Clear();
     }
     public static Native.RECT Intersect(Native.RECT a, Native.RECT b)
     {

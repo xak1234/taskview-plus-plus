@@ -54,7 +54,22 @@ sealed class TrayApp
     // canvas so its tile reappears.
     readonly List<nint> browsed = new();
     int MaxBrowsed => Math.Clamp(settings.MaxBrowsedWindows, Settings.MaxBrowsedWindowsMin, Settings.MaxBrowsedWindowsMax);
-    bool CanBrowse(nint h) => Native.IsWindow(h) && Native.IsWindowVisible(h) && !Native.IsIconic(h) && desktops.IsCurrent(h);
+    // IVirtualDesktopManager.IsWindowOnCurrentVirtualDesktop is observed to flap false for
+    // groups of otherwise-live windows during shell transitions. WindowCatalog already
+    // avoids trusting that boolean when desktop IDs are available; browse eligibility must
+    // use the same stable rule or a focused window can be dropped spuriously mid-click/move.
+    bool IsCurrentDesktopStable(nint h)
+    {
+        try
+        {
+            var current=desktops.Current;
+            if(current==Guid.Empty)return true; // unknown current desktop: never wipe browse state
+            var id=desktops.WindowDesktop(h);
+            return id==Guid.Empty?desktops.IsCurrent(h):id==current;
+        }
+        catch{return true;}
+    }
+    bool CanBrowse(nint h) => Native.IsWindow(h) && Native.IsWindowVisible(h) && !Native.IsIconic(h) && IsCurrentDesktopStable(h);
     void Promote(nint h)
     {
         browsed.Remove(h); browsed.Insert(0, h);
@@ -78,11 +93,11 @@ sealed class TrayApp
         var animation=AnimateWindowsAsync(WindowBounds(new[]{h}),false);
         browsed.Remove(h);
         var keep = browsed.FirstOrDefault();
-        // Push the demoted window under the canvas first so it can never sit over the kept
-        // one, then hand focus to the kept window (EnterBrowsing retries; on failure it
-        // falls back to the grid itself).
-        Native.SetWindowPos(h, 1, 0, 0, 0, 0, 0x13); // HWND_BOTTOM
+        // Restore the demoted source's miniature BEFORE burying its real HWND. Lowering the
+        // real window while its DWM copy is still suppressed creates a compositor-frame hole
+        // where both representations are hidden.
         foreach (var chrome in overlays.Values) chrome.SetBrowsed(browsed);
+        Native.SetWindowPos(h, 1, 0, 0, 0, 0, 0x13); // HWND_BOTTOM
         try { await animation; }
         finally
         {
@@ -130,6 +145,10 @@ sealed class TrayApp
             if(started)
             {
                 if(!browsing || !browsed.Contains(h) || !overviewMinimizing.Add(h))return;
+                // Mark the user's minimize intent BEFORE returning to the grid. Otherwise
+                // the 500 ms grid thumbnail keepalive can restore this HWND before the OS
+                // sends MINIMIZEEND, losing both the iconic state and the user's intent.
+                session.BeginUserMinimize(h);
                 // Start the registered-thumbnail journey while the real HWND still has its
                 // last visible bounds, then put that HWND behind the overview. Windows may
                 // continue its native minimize internally, but its taskbar-bound animation
@@ -140,6 +159,7 @@ sealed class TrayApp
             }
             if(!overviewMinimizing.Remove(h))return;
             if(Native.IsIconic(h))session.NoteUserMinimized(h);
+            else session.CancelUserMinimize(h);
             // Refresh persistent adornments immediately. In particular, if this source was
             // still rendered with an old dock role, its frame disappears in this same turn
             // instead of waiting for a later topology reflow/timer tick.
@@ -276,8 +296,18 @@ sealed class TrayApp
             if(activating)
             {
                 activationVersion++; activating=false; CancelAnimations();
-                // A new press supersedes the old transition; keep the current browse visible.
-                foreach(var overlay in overlays.Values)overlay.SetBrowsed(browsed);
+                // A new press supersedes the old transition. If a browse had already
+                // committed, keep it visible. If this was the FIRST focus attempt and it
+                // was cancelled after DropTopmost(), restore the grid immediately; otherwise
+                // the version-mismatched EnterBrowsing.finally intentionally does no repair.
+                if(browsing)foreach(var overlay in overlays.Values)overlay.SetBrowsed(browsed);
+                else
+                {
+                    ClearBrowsed();
+                    foreach(var overlay in overlays.Values)overlay.RaiseTopmost();
+                    if(popout?.IsInteracting!=true)popout?.BringToFront();
+                    optionsWindow?.BringToFront();
+                }
             }
             if(browsing && session.Active)
                 foreach(var overlay in overlays.Values)overlay.ReassertBrowseZOrder();
@@ -423,7 +453,7 @@ sealed class TrayApp
     // resident; the hotkey re-summons the grid.
     async void EnterBrowsing(nint h)
     {
-        if (!session.Active || h==0 || !Native.IsWindow(h) || !desktops.IsCurrent(h)) return;
+        if (!session.Active || h==0 || !Native.IsWindow(h) || !IsCurrentDesktopStable(h)) return;
         int version=++activationVersion;
         activating=true;
         // A NEW focus animation captures the target miniature's current visual position
@@ -444,12 +474,12 @@ sealed class TrayApp
                 session.PrepareActivationGeometry(h);
                 await AnimateWindowsAsync(WindowBounds(new[]{h}),true);
             }
-            if(version!=activationVersion || !session.Active || !Native.IsWindow(h) || !desktops.IsCurrent(h))return;
+            if(version!=activationVersion || !session.Active || !Native.IsWindow(h) || !IsCurrentDesktopStable(h))return;
             foreach (var chrome in overlays.Values) chrome.DropTopmost();
             for(int attempt=0;attempt<10;attempt++)
             {
                 if(version!=activationVersion || !session.Active)return;
-                if(!Native.IsWindow(h) || !desktops.IsCurrent(h))break;
+                if(!Native.IsWindow(h) || !IsCurrentDesktopStable(h))break;
                 if(session.Activate(h))
                 {
                     browsing=true;

@@ -119,7 +119,14 @@ sealed class OverlayChrome : Window
             // MA_NOACTIVATE stops the native click activation, but WinUI's island can still
             // finish a focus/activation handoff after this callback. Reassert the browse
             // z-order on the next message-loop turn, after that handoff has settled.
-            if (browsed.Count != 0) Native.PostMessage(h, ReassertBrowseZOrderMessage, 0, 0);
+            if (browsed.Count != 0)
+            {
+                // WinUI can raise this HWND after WM_MOUSEACTIVATE returns. Reveal the
+                // parked full-size DWM copies for that handoff turn so even a late raise
+                // cannot produce a blank hole before the posted z-order repair executes.
+                tilesView.ShowBrowseFallback(browsed,FocusedBrowsed());
+                Native.PostMessage(h, ReassertBrowseZOrderMessage, 0, 0);
+            }
             return 3;
         }
         // WM_ACTIVATE while browsing: MA_NOACTIVATE only stops the click itself. WinUI's
@@ -130,6 +137,10 @@ sealed class OverlayChrome : Window
         if (msg == 0x06 && (wp.ToInt64() & 0xffff) != 0)
         {
             KeepBelowBrowsed();
+            // Leave the parked full-size copies visible until the posted pass. WinUI may
+            // complete activation AFTER this callback and raise the canvas again; suppressing
+            // them here would reopen the exact one-frame blank-hole race we are guarding.
+            tilesView.ShowBrowseFallback(browsed,FocusedBrowsed());
             // Doing this only inside WM_ACTIVATE is racy: Windows/WinUI may complete the
             // activation after our SetWindowPos and raise the opaque canvas again. The
             // posted pass is authoritative once activation has actually completed.
@@ -227,6 +238,7 @@ sealed class OverlayChrome : Window
     // the overview over that window or lowers it to the bottom of the z-order.
     // Up to two windows browsed in front of this overview, primary (foreground) first.
     readonly List<nint> browsed = new();
+    string browseGuardSignature = "";
     public void SetBrowsedSource(nint source) => SetBrowsed(source == 0 ? Array.Empty<nint>() : new[] { source });
     public Task AnimateWindowsAsync(IReadOnlyDictionary<nint, Native.RECT> bounds, bool expanding)
         => tilesView.AnimateWindowsAsync(bounds, expanding);
@@ -235,7 +247,12 @@ sealed class OverlayChrome : Window
     public void SetBrowsed(IReadOnlyList<nint> sources)
     {
         browsed.Clear(); browsed.AddRange(sources.Where(s => s != 0).Distinct().Take(Settings.MaxBrowsedWindowsMax));
-        tilesView.SetSuppressed(browsed);
+        if(browsed.Count==0)
+        {
+            browseGuardSignature="";
+            tilesView.SetBrowsePresentation(browsed,browsed,0);
+            return;
+        }
         KeepBelowBrowsed();
     }
     public void ReassertBrowseZOrder()
@@ -244,16 +261,54 @@ sealed class OverlayChrome : Window
         KeepBelowBrowsed();
         Native.PostMessage(Handle, ReassertBrowseZOrderMessage, 0, 0);
     }
-    // Enforce primary > secondary > canvas in the z-order without changing activation.
-    // Idempotent; a no-op when the grid is up.
+    nint FocusedBrowsed()
+    {
+        var fg=Native.GetForegroundWindow();
+        var root=fg==0?0:Native.GetAncestor(fg,3);
+        var focused=browsed.FirstOrDefault(b=>b==fg||b==root);
+        // Our canvas/options/popout can transiently own foreground while the browse remains
+        // live. Keep the logical primary thick in that handoff instead of making every frame
+        // look unfocused for one turn.
+        return focused!=0?focused:browsed.FirstOrDefault();
+    }
+    // Keep the canvas below EVERY browsed real HWND without changing the real windows'
+    // order relative to one another. Windows already puts the foreground source on top;
+    // forcing primary/secondary order ourselves during a native move fights that activation
+    // and was a source of intermittent disappear/reappear cycles.
     void KeepBelowBrowsed()
     {
-        if (browsed.Count == 0 || !Native.IsWindowVisible(Handle)) return;
-        var live = browsed.Where(Native.IsWindow).ToList();
-        if (live.Count == 0) return;
+        if (browsed.Count == 0) return;
+        if (!Native.IsWindowVisible(Handle))
+        {
+            tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),FocusedBrowsed());
+            return;
+        }
+        var live = browsed.Where(s=>Native.IsWindow(s)&&Native.IsWindowVisible(s)&&!Native.IsIconic(s)).ToList();
+        if (live.Count == 0)
+        {
+            tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),0);
+            return;
+        }
         if (presenter.IsAlwaysOnTop) presenter.IsAlwaysOnTop = false;
-        for (int i = 1; i < live.Count; i++) Native.SetWindowPos(live[i], live[i - 1], 0, 0, 0, 0, 0x13); // secondary directly under primary
-        Native.SetWindowPos(Handle, live[^1], 0, 0, 0, 0, 0x13); // canvas directly under the lowest browsed
+        // Find the lowest browsed source in the CURRENT OS z-order, then insert the canvas
+        // directly beneath it. This preserves whichever source the user just clicked/moved.
+        var lowest=live[0];
+        for(int i=1;i<live.Count;i++)if(Native.IsAbove(lowest,live[i]))lowest=live[i];
+        Native.SetWindowPos(Handle, lowest, 0, 0, 0, 0, 0x13);
+
+        // Hard invariant: a miniature is suppressed only if its real source is demonstrably
+        // above this opaque overview RIGHT NOW. If Windows/WinUI is still settling z-order,
+        // leave that miniature visible at the real HWND rectangle until the posted retry.
+        var safe=live.Where(s=>Native.IsAbove(s,Handle)).ToList();
+        tilesView.SetBrowsePresentation(browsed,safe,FocusedBrowsed());
+        var unsafeSources=live.Where(s=>!safe.Contains(s)).ToList();
+        var signature=string.Join(",",unsafeSources);
+        if(signature!=browseGuardSignature)
+        {
+            browseGuardSignature=signature;
+            if(unsafeSources.Count>0)
+                Log.Write($"[browse-guard] overlay {Handle} kept thumbnail fallback for {string.Join(",",unsafeSources)}; fg={Native.GetForegroundWindow()}");
+        }
     }
     // Re-summon the grid on top and push every source back to the bottom of the z-order.
     public void RaiseTopmost()

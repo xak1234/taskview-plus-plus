@@ -114,6 +114,18 @@ public static class Native
             return true; // DWMWA_EXTENDED_FRAME_BOUNDS
         return GetWindowRect(h,out r) && r.Width>0 && r.Height>0;
     }
+    // True when `upper` is currently above `lower` in the top-level HWND z-order.
+    // Walking from lower toward the top avoids changing activation merely to verify the
+    // browse invariant (real source above opaque overview). Cap the walk defensively in
+    // case a broken/tearing HWND chain is observed while another process is closing.
+    public static bool IsAbove(nint upper,nint lower)
+    {
+        if(upper==0||lower==0||upper==lower)return false;
+        var h=GetWindow(lower,3); // GW_HWNDPREV = next window above `lower`.
+        for(int i=0;h!=0&&i<4096;i++,h=GetWindow(h,3))
+            if(h==upper)return true;
+        return false;
+    }
     public static void DisableDwmBorder(nint h) {
         // DWMWA_BORDER_COLOR + DWMWA_COLOR_NONE removes Windows 11's thin native
         // outline around otherwise-borderless StayView windows.
