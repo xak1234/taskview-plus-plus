@@ -17,7 +17,7 @@ public sealed class InputHooks : IDisposable
         if(browsing!=value){lastDown=0; GestureVersion++; pendingClient=0;}
         if(!value && dragArmed && dragButton==2) swallowRightRelease=true;
         browsing = value;
-        if (!value) { dragArmed = false; dragging = false; dragButton=0; }
+        if (!value) { CancelRightHold(); dragArmed = false; dragging = false; dragButton=0; }
     } }
     public long GestureVersion { get; private set; }
     bool lastWasCaption, lastWasClient;
@@ -29,6 +29,10 @@ public sealed class InputHooks : IDisposable
     bool swallowRelease;
     Native.POINT lastDownPoint;
     public Func<bool>? IsActive;
+    public Func<nint,bool>? IsPinnedWindow;
+    // The overview's own HWNDs. A right-hold on one resolves to the tile underneath.
+    public Func<nint,bool>? IsOverviewWindow;
+    public Func<Native.POINT,nint>? OverviewPinTarget;
     // The window a left-drag may move (the one currently browsed).
     public Func<nint>? BrowsedWindow;
     public event Action<nint>? WindowDragged;
@@ -44,8 +48,17 @@ public sealed class InputHooks : IDisposable
     // the cursor is over an embedded app owned by another process.
     int dragButton;
     bool swallowRightRelease;
+    // Long enough to remain distinct from an ordinary context-menu click, but short
+    // enough to feel like a deliberate hold instead of an unexplained frozen button.
+    const int PinHoldMilliseconds=900;
+    System.Threading.Timer? rightHoldTimer;
+    int rightHoldGeneration;
+    volatile bool rightHoldTriggered;
+    volatile bool rightDragAllowed;
+    bool rightHoldMoved;
     public event Action? Escape;
     public event Action? Toggle;
+    public event Action<nint>? PinToggle;
     public event Action<nint>? DoubleClick; // the browsed/foreground window that was double-clicked
     public event Action<int>? DesktopDirection;
     public string HotkeyText { get; private set; } = "Ctrl + Win + Space";
@@ -66,8 +79,31 @@ public sealed class InputHooks : IDisposable
         // The overview may have reopened between the second down and its up.
         // Consume the matching release even after browsing was disabled.
         if(msg==0x202 && swallowRelease){swallowRelease=false;return 1;}
+        if(msg==0x200 && pinnedClickPending)
+        {
+            // The button-down was swallowed so the pinned window cannot start a native
+            // move. Still let the cursor move, and remember a real drag so the matching
+            // release is not replayed as a click into an editor.
+            if(Math.Max(Math.Abs(mouse.Point.X-pinnedClickStart.X),Math.Abs(mouse.Point.Y-pinnedClickStart.Y))>=DragThreshold)
+                pinnedClickMoved=true;
+            return Native.CallNextHookEx(mouseHook, code, wp, lp);
+        }
+        if(msg==0x202 && swallowPinnedLeftRelease)
+        {
+            swallowPinnedLeftRelease=false;
+            // A stationary press never became a move. Replay it so the app can place a
+            // caret. Custom-chrome editors report that area as non-client; swallowing
+            // the click outright left those windows unable to take text after a pin.
+            bool replay=pinnedClickPending && !pinnedClickMoved;
+            pinnedClickPending=false; pinnedClickMoved=false;
+            if(replay) ReplayClick(false);
+            return 1;
+        }
         if(msg==0x205 && swallowRightRelease){swallowRightRelease=false;return 1;}
-        if(!browsing)return Native.CallNextHookEx(mouseHook, code, wp, lp);
+        // Pin holds must work while the grid is up, not only while a window is focused.
+        // A right-hold on a small tile or any other non-focused window is armed here.
+        if(!browsing && msg!=0x204 && msg!=0x205 && !(msg==0x200 && dragArmed && dragButton==2))
+            return Native.CallNextHookEx(mouseHook, code, wp, lp);
         if (msg is 0x204 or 0x207 or 0x20B or 0x20A or 0x20E)
         { GestureVersion++; lastDown = 0; pendingClient = 0; }
         if (msg == 0x200) // WM_MOUSEMOVE
@@ -77,10 +113,17 @@ public sealed class InputHooks : IDisposable
             { lastDown = 0; pendingClient = 0; GestureVersion++; }
             if (!dragArmed) return Native.CallNextHookEx(mouseHook, code, wp, lp);
             var mp = mouse.Point;
+            int distance=Math.Max(Math.Abs(mp.X-dragStart.X),Math.Abs(mp.Y-dragStart.Y));
+            if(dragButton==2&&!rightDragAllowed)
+            {
+                if(distance>=DragThreshold){rightHoldMoved=true;CancelRightHold();}
+                return Native.CallNextHookEx(mouseHook, code, wp, lp);
+            }
             if (!dragging)
             {
-                if (Math.Max(Math.Abs(mp.X - dragStart.X), Math.Abs(mp.Y - dragStart.Y)) < DragThreshold)
+                if (distance < DragThreshold)
                     return Native.CallNextHookEx(mouseHook, code, wp, lp);
+                if(dragButton==2)CancelRightHold();
                 dragging = true;
                 lastDown = 0;
                 // A maximized window cannot be moved by SetWindowPos. Restore it first (as
@@ -112,7 +155,7 @@ public sealed class InputHooks : IDisposable
         if(msg==0x204) // WM_RBUTTONDOWN
         {
             GestureVersion++;lastDown=0;pendingClient=0;
-            if(!TryArmRightDrag(mouse.Point))
+            if(!TryArmRightGesture(mouse.Point))
                 return Native.CallNextHookEx(mouseHook,code,wp,lp);
             // Suppress the app's right-down while the gesture is undecided. If the pointer
             // never moves past the drag threshold, replay a normal right click on release.
@@ -122,8 +165,13 @@ public sealed class InputHooks : IDisposable
         {
             if(!dragArmed||dragButton!=2)
                 return Native.CallNextHookEx(mouseHook,code,wp,lp);
+            bool toggled=rightHoldTriggered,moved=rightHoldMoved;
+            CancelRightHold();
+            rightHoldTriggered=false;rightHoldMoved=false;rightDragAllowed=false;
             dragArmed=false;dragButton=0;
+            if(toggled)return 1;
             if(dragging){dragging=false;WindowDragged?.Invoke(dragTarget);return 1;}
+            if(moved){if(!rightDragAllowed)ReplayClick(true);return 1;}
             ReplayClick(true);
             return 1;
         }
@@ -133,6 +181,13 @@ public sealed class InputHooks : IDisposable
             GestureVersion++;
             pendingClient = 0;
             var p = mouse.Point;
+            if(TryBlockPinnedNonClient(p))
+            {
+                lastDown=0;dragArmed=false;dragging=false;dragButton=0;pendingClient=0;
+                pinnedClickPending=true; pinnedClickMoved=false; pinnedClickStart=p;
+                swallowPinnedLeftRelease=true;
+                return 1;
+            }
             // Caption and client gestures never combine. Only confirmed caption clicks
             // are consumed here; empty-client classification happens outside the hook.
             bool claimed = TryArmDrag(p, out var pressed, out var canShrink, out var isClient);
@@ -172,6 +227,16 @@ public sealed class InputHooks : IDisposable
         ReplayClick(false);
         return 1;
     }
+    bool swallowPinnedLeftRelease;
+    bool pinnedClickPending, pinnedClickMoved;
+    Native.POINT pinnedClickStart;
+    bool TryBlockPinnedNonClient(Native.POINT p)
+    {
+        var target=Native.GetAncestor(Native.WindowFromPoint(p),2);
+        if(target==0 || IsPinnedWindow?.Invoke(target)!=true || !Native.GetWindowRect(target,out var r))return false;
+        var hit=HitTest(target,p,r);
+        return FocusedClickPolicy.PinBlocksNonClient(hit,hit==null&&InFallbackCaption(p,r));
+    }
     // Arm a move of the window under the cursor, if the press landed on its title bar.
     // It must be a real top-level window of another process (never our own overlay or a
     // shell surface) and either the browsed window or the current foreground one.
@@ -183,6 +248,7 @@ public sealed class InputHooks : IDisposable
         isClient = false;
         var target = Native.GetAncestor(Native.WindowFromPoint(p), 2); // GA_ROOT
         if (target == 0) return false;
+        if(IsPinnedWindow?.Invoke(target)==true)return false;
         Native.GetWindowThreadProcessId(target, out var pid);
         if (pid == Environment.ProcessId) return false; // our overlay: leave it to XAML
         var cls = Native.Class(target);
@@ -215,9 +281,40 @@ public sealed class InputHooks : IDisposable
         dragTarget = target; dragStart = p; dragOrigin = r; dragArmed = true; dragging = false; dragLogged = false;dragButton=1;
         return true;
     }
-    bool TryArmRightDrag(Native.POINT p)
+    bool ArmStationaryPin(nint target, Native.POINT p)
     {
+        Native.GetWindowRect(target,out var r);
+        dragTarget=target;dragStart=p;dragOrigin=r;dragArmed=true;dragging=false;dragLogged=false;dragButton=2;
+        // This hold only pins. It must not start a move of a window the user is not focused in.
+        rightDragAllowed=false;
+        rightHoldTriggered=false;rightHoldMoved=false;
+        StartRightHold(target);
+        return true;
+    }
+    bool TryArmRightGesture(Native.POINT p)
+    {
+        var hitWindow=Native.WindowFromPoint(p);
+        var under=Native.GetAncestor(hitWindow,2);
+        if(under==0)under=hitWindow;
+        // The overview covers the real windows. A right-hold here belongs to the tile
+        // under the cursor, never to the focused window whose rectangle happens to lie
+        // behind that tile.
+        if((under!=0 && IsOverviewWindow?.Invoke(under)==true) || (hitWindow!=0 && IsOverviewWindow?.Invoke(hitWindow)==true))
+        {
+            var tile=OverviewPinTarget?.Invoke(p)??0;
+            if(tile!=0 && Native.IsWindow(tile))return ArmStationaryPin(tile,p);
+            return false;
+        }
         var target=BrowsedWindow?.Invoke()??0;
+        bool onFocused=target!=0 && PointInsideWindow(target,p) && (under==target || under==0 || Native.GetAncestor(under,3)==target);
+        if(!onFocused && under!=0 && under!=target && Native.IsWindow(under) && PointInsideWindow(under,p))
+        {
+            Native.GetWindowThreadProcessId(under,out var otherPid);
+            var cls=Native.Class(under);
+            if(otherPid!=0 && otherPid!=Environment.ProcessId
+                && cls is not ("Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or "Progman" or "WorkerW"))
+                return ArmStationaryPin(under,p);
+        }
         var foreground=Native.GetForegroundWindow();
         bool selectedFocused=target!=0&&(foreground==target||Native.GetAncestor(foreground,3)==target);
         if(!selectedFocused||!Native.IsWindow(target)||Native.IsIconic(target)||!PointInsideWindow(target,p))
@@ -230,8 +327,38 @@ public sealed class InputHooks : IDisposable
             if(pid==Environment.ProcessId)return false;
         }
         if(!Native.GetWindowRect(target,out var r))return false;
+        // Right-drag remains available anywhere inside the focused host. Only a stationary
+        // title-bar hold arms pin/unpin, so application content never becomes a pin gesture.
+        var hit=HitTest(target,p,r);
+        bool fallbackCaption=hit==null&&InFallbackCaption(p,r);
         dragTarget=target;dragStart=p;dragOrigin=r;dragArmed=true;dragging=false;dragLogged=false;dragButton=2;
+        rightDragAllowed=IsPinnedWindow?.Invoke(target)!=true;
+        rightHoldTriggered=false;rightHoldMoved=false;
+        if(FocusedClickPolicy.CanPinHold(hit,fallbackCaption))StartRightHold(target);
+        else CancelRightHold();
         return true;
+    }
+    void StartRightHold(nint target)
+    {
+        CancelRightHold();
+        int generation=Interlocked.Increment(ref rightHoldGeneration);
+        rightHoldTimer=new System.Threading.Timer(_=>{
+            // The swallowed right-down never reaches USER32's ordinary button-state path,
+            // so GetAsyncKeyState cannot be used here: it reports "up" even while the user
+            // is still holding. Generation is the authority; button-up/movement increments
+            // it synchronously through the same low-level hook and cancels this callback.
+            if(generation!=Volatile.Read(ref rightHoldGeneration))return;
+            rightHoldTriggered=true;
+            rightDragAllowed=false;
+            Log.Write($"[pin] stationary title-bar right hold completed for {target}");
+            PinToggle?.Invoke(target);
+        },null,PinHoldMilliseconds,Timeout.Infinite);
+    }
+    void CancelRightHold()
+    {
+        Interlocked.Increment(ref rightHoldGeneration);
+        var timer=rightHoldTimer;rightHoldTimer=null;
+        timer?.Dispose();
     }
     // Ask the window itself (WM_NCHITTEST) so each app's real chrome is respected, with a
     // short timeout so a hung app cannot stall the mouse hook. HTGROWBOX and the eight
@@ -309,5 +436,5 @@ public sealed class InputHooks : IDisposable
         }
         return Native.CallNextHookEx(hook, code, wp, lp);
     }
-    public void Dispose() { if (hook != 0) Native.UnhookWindowsHookEx(hook); if (mouseHook != 0) Native.UnhookWindowsHookEx(mouseHook); Native.UnregisterHotKey(hwnd, 1); GC.KeepAlive(keyCallback); GC.KeepAlive(mouseCallback); }
+    public void Dispose() { CancelRightHold(); if (hook != 0) Native.UnhookWindowsHookEx(hook); if (mouseHook != 0) Native.UnhookWindowsHookEx(mouseHook); Native.UnregisterHotKey(hwnd, 1); GC.KeepAlive(keyCallback); GC.KeepAlive(mouseCallback); }
 }

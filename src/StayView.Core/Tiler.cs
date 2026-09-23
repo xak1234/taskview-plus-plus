@@ -1,8 +1,47 @@
-﻿namespace StayView.Core;
+namespace StayView.Core;
 public enum TileRole { Hero,Satellite,Dock }
 public sealed record Tile(AppWindow Window,Native.RECT Cell,Native.RECT Client,bool Preview,TileRole Role);
+public sealed record DesktopStripGeometry(double CardWidth,double AddWidth,double AddLeft,IReadOnlyList<double> DesktopLefts,double GroupLeft,double GroupRight);
 public static class Tiler
 {
+    // Desktop-strip geometry is shared with tests so the mixed-width + card stays centered.
+    // The add card is label-width and inserted at the midpoint rather than being permanently
+    // appended on the far right.
+    // addGap is the space between the + card and the desktops either side of it (defaults
+    // to the card-to-card gap).
+    public static DesktopStripGeometry DesktopStripLayout(
+        int desktopCount,bool includeAdd,double canvasWidth,double gap,double requestedAddWidth=72,double? addGap=null)
+    {
+        double sideGap=Math.Max(0,addGap??gap);
+        desktopCount=Math.Max(0,desktopCount);
+        double available=Math.Max(1,canvasWidth-48);
+        if(desktopCount==0&&!includeAdd)return new(0,0,canvasWidth/2,[],canvasWidth/2,canvasWidth/2);
+        if(!includeAdd)
+        {
+            double width=Math.Min(242,Math.Max(28,(available-Math.Max(0,desktopCount-1)*gap)/Math.Max(1,desktopCount)));
+            double total=desktopCount*width+Math.Max(0,desktopCount-1)*gap;
+            double left=(canvasWidth-total)/2;
+            return new(width,0,canvasWidth/2,Enumerable.Range(0,desktopCount).Select(i=>left+i*(width+gap)).ToArray(),left,left+total);
+        }
+
+        // The + control itself is pinned to the exact horizontal centre. Existing desktops
+        // are split around it; when the count is odd the extra desktop goes on the left.
+        int leftCount=(desktopCount+1)/2,rightCount=desktopCount-leftCount;
+        int maxSide=Math.Max(leftCount,rightCount);
+        double addWidth=Math.Clamp(requestedAddWidth,28,Math.Max(28,canvasWidth-48));
+        double addLeft=(canvasWidth-addWidth)/2;
+        double sideAvailable=Math.Max(1,addLeft-24);
+        double cardWidth=maxSide==0?242:Math.Min(242,Math.Max(28,(sideAvailable-sideGap-(maxSide-1)*gap)/maxSide));
+        var positions=new List<double>(desktopCount);
+        double leftStart=addLeft-sideGap-leftCount*cardWidth-Math.Max(0,leftCount-1)*gap;
+        for(int i=0;i<leftCount;i++)positions.Add(leftStart+i*(cardWidth+gap));
+        double rightStart=addLeft+addWidth+sideGap;
+        for(int i=0;i<rightCount;i++)positions.Add(rightStart+i*(cardWidth+gap));
+        double groupLeft=leftCount>0?leftStart:addLeft;
+        double groupRight=rightCount>0?rightStart+(rightCount-1)*(cardWidth+gap)+cardWidth:addLeft+addWidth;
+        return new(cardWidth,addWidth,addLeft,positions,groupLeft,groupRight);
+    }
+
     public static IReadOnlyList<Native.RECT> Layout(int count,Native.RECT area,int gap,int minWidth,nint expanded,IReadOnlyList<AppWindow> windows) {
         if(count==0)return [];
         int selected=expanded==0?-1:windows.ToList().FindIndex(x=>x.Handle==expanded);

@@ -38,7 +38,18 @@ public static class FocusedClickPolicy
     public static bool CanShrink(int? hit, bool fallbackCaption = false)
         => hit == 2 || (hit == null && fallbackCaption);
 
+    // Pin/unpin uses the same safe title-bar classification as shrink, but is kept
+    // separate so client-area right-drag can remain available without arming a pin hold.
+    public static bool CanPinHold(int? hit, bool fallbackCaption = false)
+        => hit == 2 || (hit == null && fallbackCaption);
+
     public static bool CanDrag(int? hit, bool winHeld, bool fallbackCaption)
         => hit == 2 || (hit == 1 && winHeld)
             || (hit == null && (winHeld || fallbackCaption));
+
+    // A pinned focused window keeps its exact geometry. App client clicks still pass
+    // through, as do the native Minimize and Close buttons; all other non-client actions
+    // that can move/resize/maximize the window are blocked while it is pinned.
+    public static bool PinBlocksNonClient(int? hit, bool fallbackCaption = false)
+        => hit == null ? fallbackCaption : hit > 1 && hit is not 8 and not 20;
 }

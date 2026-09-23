@@ -13,9 +13,11 @@ public sealed class PlacementStore
 {
     static readonly JsonSerializerOptions json=new(){IncludeFields=true,WriteIndented=true};
     public static string Journal=>Path.Combine(Settings.Folder,"placements.json");
+    readonly string journal;
+    public PlacementStore(string? journalPath=null){journal=journalPath??Journal;}
     readonly Dictionary<nint,SavedPlacement> saved=[];
     public IReadOnlyDictionary<nint,SavedPlacement> Entries=>saved;
-    static bool TrySnapshot(nint h,int z,Guid desktopId,out SavedPlacement snapshot)
+    public static bool TrySnapshot(nint h,int z,Guid desktopId,out SavedPlacement snapshot)
     {
         snapshot=new();
         if(h==0||!Native.IsWindow(h))return false;
@@ -36,7 +38,7 @@ public sealed class PlacementStore
         saved[h]=snapshot;
         return true;
     }
-    public void Persist() {Directory.CreateDirectory(Settings.Folder);File.WriteAllText(Journal+".tmp",JsonSerializer.Serialize(saved.Values,json));File.Move(Journal+".tmp",Journal,true);}
+    public void Persist() {Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(journal))!);File.WriteAllText(journal+".tmp",JsonSerializer.Serialize(saved.Values,json));File.Move(journal+".tmp",journal,true);}
     // A window the user deliberately dragged keeps where they put it: refresh its journal
     // entry (same z-order and desktop) so dismissal restores the new spot, not the old one.
     public void Recapture(nint h) {
@@ -46,6 +48,22 @@ public sealed class PlacementStore
         // restore state for the rest of the session.
         if(!TrySnapshot(h,old.Z,old.DesktopId,out var replacement))return;
         saved[h]=replacement;
+        Persist();
+    }
+    // Update only geometry after StayView makes a safety correction (for example moving a
+    // title bar back below the top of the work area). Preserve the original show state,
+    // z-order/topmost intent and desktop metadata rather than recapturing temporary overview
+    // state such as HWND_BOTTOM.
+    public void UpdateGeometry(nint h)
+    {
+        if(!saved.TryGetValue(h,out var entry) || Native.IsIconic(h) || !Native.GetWindowRect(h,out var bounds))return;
+        var current=Native.Placement(h);
+        var p=entry.Placement;
+        p.NormalPosition=current.NormalPosition;
+        entry.Placement=p;
+        entry.Bounds=bounds;
+        entry.Monitor=Native.MonitorFromWindow(h,2);
+        entry.Dpi=Native.GetDpiForWindow(h);
         Persist();
     }
     public void MarkMinimized(nint h)
@@ -67,7 +85,8 @@ public sealed class PlacementStore
         if((dx==0&&dy==0)||!saved.TryGetValue(h,out var entry))return false;
         static Native.RECT Shift(Native.RECT r,int x,int y)
             => new(r.Left+x,r.Top+y,r.Width,r.Height);
-        entry.Bounds=Shift(entry.Bounds,dx,dy);
+        var bounds=entry.Bounds;
+        if(Native.MonitorFromRect(ref bounds,0)!=0)entry.Bounds=Shift(bounds,dx,dy);
         var p=entry.Placement;
         p.NormalPosition=Shift(p.NormalPosition,dx,dy);
         entry.Placement=p;
@@ -92,7 +111,7 @@ public sealed class PlacementStore
             if(entry.DesktopId==desktopId){entry.DesktopId=Guid.Empty;changed=true;}
         if(changed)Persist();
     }
-    void PersistOrDelete(){if(saved.Count>0)Persist();else try{File.Delete(Journal);}catch{}}
+    void PersistOrDelete(){if(saved.Count>0)Persist();else try{File.Delete(journal);}catch{}}
     static bool SameWindow(SavedPlacement s) {
         var h=(nint)s.Handle;if(!Native.IsWindow(h))return false;
         Native.GetWindowThreadProcessId(h,out var pid);if(pid!=s.ProcessId)return false;
@@ -101,14 +120,33 @@ public sealed class PlacementStore
     public static bool RestoreOne(SavedPlacement s,VirtualDesktopService? desktops=null) {
         if(!SameWindow(s))return true;
         var h=(nint)s.Handle;var p=s.Placement;p.Length=System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>();
+        int show=p.ShowCmd;
+        if(show==1)p.ShowCmd=4; // Restore geometry without activating another desktop.
+        else if(show is 2 or 6 or 7)p.ShowCmd=7;
         bool ok=Native.SetWindowPlacement(h,ref p);
-        if(p.ShowCmd==1) {var r=s.Bounds;
-            if(Native.MonitorFromRect(ref r,0)==0) {var work=Native.WorkArea(Native.MonitorFromWindow(h,2));r=new(work.Left+20,work.Top+20,Math.Min(r.Width,work.Width-40),Math.Min(r.Height,work.Height-40));}
+        var r=s.Bounds;
+        if(show==1 && Native.MonitorFromRect(ref r,0)!=0) {
             ok=Native.SetWindowPos(h,s.Topmost?-1:0,r.Left,r.Top,r.Width,r.Height,0x10|0x4000)&&ok;
         }else ok=Native.SetWindowPos(h,s.Topmost?-1:0,0,0,0,0,0x13|0x4000)&&ok;
         // A failed restore remains in the journal; never substitute an invented size.
         if(s.DesktopId!=Guid.Empty){desktops??=new VirtualDesktopService();if(desktops.WindowDesktop(h)!=s.DesktopId)ok=desktops.Move(h,s.DesktopId)&&ok;}
         return ok;
+    }
+    // Bounds captured while iconic are not screen positions. In that case let Windows
+    // interpret NormalPosition itself, including taskbar/workspace offsets.
+    public static bool ApplyPendingGeometry(nint h,SavedPlacement saved)
+    {
+        var bounds=saved.Bounds;
+        if(Native.IsIconic(h)||Native.IsZoomed(h)||Native.MonitorFromRect(ref bounds,0)==0)
+        {
+            var p=Native.Placement(h);
+            p.Length=System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>();
+            p.NormalPosition=saved.Placement.NormalPosition;
+            if(!Native.IsIconic(h)&&!Native.IsZoomed(h))p.ShowCmd=4;
+            else if(Native.IsIconic(h))p.ShowCmd=7;
+            return Native.SetWindowPlacement(h,ref p);
+        }
+        return Native.SetWindowPos(h,0,bounds.Left,bounds.Top,0,0,0x15);
     }
     public void Restore() {
         // One desktop service for the whole batch instead of one COM activation per window.

@@ -5,21 +5,19 @@ using StayView.Core;
 
 namespace StayView;
 
-// Options panel. Visual language matches the overview: acrylic panel, glass "cards" per
-// section, tiny uppercase monospace eyebrow labels (same as the desktop-card labels), one
-// segmented pill control per setting (selected segment filled dark blue), and a quiet
-// outlined Exit at the bottom.
+// Settings panel, styled after Windows 11 Settings: a branded header, titled sections of
+// rounded cards, one row per setting (name + one-line description on the left, control on
+// the right), native toggle switches for on/off settings and a segmented control for
+// choices. Dropdowns are avoided on purpose: this transient panel closes when it loses
+// activation, and a popup list could trigger that.
 sealed class OptionsWindow : Window
 {
     readonly Settings settings;
     readonly Action appearanceChanged;
     readonly Action layoutChanged;
-    readonly Action tileSizeChanged;
     readonly Action exitApp;
     readonly Grid root=new();
-    readonly DispatcherTimer sizeCommitTimer=new(){Interval=TimeSpan.FromMilliseconds(120)};
     bool hasActivated;
-    bool sizeDirty;
     public nint Handle => WinRT.Interop.WindowNative.GetWindowHandle(this);
     public void BringToFront()
     {
@@ -28,14 +26,17 @@ sealed class OptionsWindow : Window
     }
     public void Present(){Activate();BringToFront();}
 
-    static readonly FontFamily Mono=new("Cascadia Mono, Consolas");
-    const int CardOpacity=58;
-    const int PillOpacity=78;
+    static readonly FontFamily Display=new("Segoe UI Variable Display, Segoe UI");
+    static readonly FontFamily Text=new("Segoe UI Variable Text, Segoe UI");
+    static readonly FontFamily Icons=new("Segoe Fluent Icons, Segoe MDL2 Assets");
+    const int CardOpacity=52;
+    const int PillOpacity=70;
+    const double PanelWidth=560;
 
-    public OptionsWindow(Settings settings,Action appearanceChanged,Action layoutChanged,Action tileSizeChanged,Action exitApp,nint owner)
+    public OptionsWindow(Settings settings,Action appearanceChanged,Action layoutChanged,Action exitApp,nint owner)
     {
-        this.settings=settings;this.appearanceChanged=appearanceChanged;this.layoutChanged=layoutChanged;this.tileSizeChanged=tileSizeChanged;this.exitApp=exitApp;
-        Title="Taskview++ Options";
+        this.settings=settings;this.appearanceChanged=appearanceChanged;this.layoutChanged=layoutChanged;this.exitApp=exitApp;
+        Title="Taskview++ Settings";
         var handle=WinRT.Interop.WindowNative.GetWindowHandle(this);
         // Keep Options structurally above the overview that launched it (see git history):
         // ownership stops the overview's z-order maintenance burying a fresh panel.
@@ -57,27 +58,12 @@ sealed class OptionsWindow : Window
             // Transient settings panel: once genuinely active, an outside click dismisses it.
             if(hasActivated)Close();
         };
-        sizeCommitTimer.Tick+=(_,_)=>CommitSize();
-        Closed+=(_,_)=>CommitSize();
 
         root.RequestedTheme=ElementTheme.Dark;
         Content=root;
 
-        // Header: eyebrow + title, close at top-right.
-        var header=new Grid{Padding=new Thickness(22,18,14,6)};
-        header.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(1,GridUnitType.Star)});
-        header.ColumnDefinitions.Add(new ColumnDefinition{Width=GridLength.Auto});
-        var titles=new StackPanel{Spacing=1};
-        titles.Children.Add(Eyebrow("TASKVIEW++"));
-        titles.Children.Add(new TextBlock{Text="Options",FontSize=22,FontWeight=Microsoft.UI.Text.FontWeights.SemiBold,Foreground=GlassAppearance.PrimaryBrush()});
-        header.Children.Add(titles);
-        var close=new Button{Content="\u2715",Width=30,Height=30,Padding=new Thickness(0),FontSize=12,VerticalAlignment=VerticalAlignment.Top,
-            CornerRadius=new CornerRadius(8),BorderThickness=new Thickness(1),BorderBrush=GlassAppearance.EdgeBrush(),
-            Background=GlassAppearance.SurfaceBrush(PillOpacity),Foreground=GlassAppearance.SecondaryBrush()};
-        close.Click+=(_,_)=>Close();
-        Grid.SetColumn(close,1);header.Children.Add(close);
-
-        var body=new StackPanel{Spacing=12,Padding=new Thickness(22,6,22,20)};
+        var header=Header();
+        var body=new StackPanel{Spacing=6,Padding=new Thickness(24,4,24,22)};
         var scroller=new ScrollViewer{Content=body,VerticalScrollBarVisibility=ScrollBarVisibility.Auto,HorizontalScrollBarVisibility=ScrollBarVisibility.Disabled};
         var layout=new Grid();
         layout.RowDefinitions.Add(new RowDefinition{Height=GridLength.Auto});
@@ -86,44 +72,94 @@ sealed class OptionsWindow : Window
         layout.Children.Add(header);layout.Children.Add(scroller);
         root.Children.Add(layout);
 
+        body.Children.Add(new TextBlock{Text="Changes apply instantly",FontFamily=Text,FontSize=12,Foreground=GlassAppearance.SecondaryBrush(),
+            HorizontalAlignment=HorizontalAlignment.Center,Margin=new Thickness(0,0,0,4)});
+
         // APPEARANCE
-        var appearance=Card("APPEARANCE");
-        Row(appearance,"Theme",new[]{"Blue-black","Darker","More blue","Light"},(int)settings.BackgroundTheme,i=>{settings.BackgroundTheme=(BackgroundTheme)i;SaveAppearance();},stacked:true);
+        var appearance=Section(body,"Appearance");
+        Setting(appearance,"Theme","Overview background colour",
+            Segmented(new[]{"Blue-black","Darker","More blue","Light"},(int)settings.BackgroundTheme,i=>{settings.BackgroundTheme=(BackgroundTheme)i;SaveAppearance();},true),stacked:true);
         // GlassOpacity is backdrop OPACITY, so High transparency is the lowest value.
-        Row(appearance,"Transparency",new[]{"Low","Medium","High"},Nearest(settings.GlassOpacity,85,65,35),i=>{settings.GlassOpacity=new[]{85,65,35}[i];SaveAppearance();});
-        body.Children.Add(appearance.Card);
+        Setting(appearance,"Transparency","How much of the desktop shows through",
+            Segmented(new[]{"Low","Medium","High"},Nearest(settings.GlassOpacity,85,65,35),i=>{settings.GlassOpacity=new[]{85,65,35}[i];SaveAppearance();}));
 
         // LAYOUT
-        var layoutCard=Card("LAYOUT");
-        Row(layoutCard,"Auto-arrange",new[]{"On","Off"},settings.AutoArrange?0:1,i=>{settings.AutoArrange=i==0;settings.Save();layoutChanged();});
-        Row(layoutCard,"Grid",new[]{"2\u00D72","4\u00D74","5\u00D75"},settings.AutoArrangeGrid==2?0:settings.AutoArrangeGrid==5?2:1,i=>{settings.AutoArrangeGrid=new[]{2,4,5}[i];settings.Save();layoutChanged();});
-        Row(layoutCard,"Focused windows",new[]{"1","2","3","4","5"},Math.Clamp(settings.MaxBrowsedWindows,1,5)-1,i=>{settings.MaxBrowsedWindows=i+1;settings.Save();layoutChanged();});
-        SliderRow(layoutCard);
-        Row(layoutCard,"Dock minimized windows",new[]{"On","Off"},settings.DockMinimizedWindows?0:1,i=>{settings.DockMinimizedWindows=i==0;settings.Save();layoutChanged();});
-        body.Children.Add(layoutCard.Card);
+        var layoutCard=Section(body,"Layout");
+        Setting(layoutCard,"Auto-arrange","Keep windows in the Task View layout",
+            Toggle(settings.AutoArrange,v=>{settings.AutoArrange=v;settings.Save();layoutChanged();}));
+        Setting(layoutCard,"Focused windows","How many windows can be brought forward at once",
+            Segmented(new[]{"1","2","3","4","5"},Math.Clamp(settings.MaxBrowsedWindows,1,5)-1,i=>{settings.MaxBrowsedWindows=i+1;settings.Save();layoutChanged();}));
+
+        // DOCK
+        var dock=Section(body,"Dock");
+        Setting(dock,"Dock minimized windows","Minimized windows sit in the desktop bar",
+            Toggle(settings.DockMinimizedWindows,v=>{settings.DockMinimizedWindows=v;settings.Save();layoutChanged();}));
+        Setting(dock,"Dock on bar contact","Pushing a window into the bar docks it",
+            Toggle(settings.DockOnBarContact,v=>{settings.DockOnBarContact=v;settings.Save();}));
+        Setting(dock,"Plasma effect","Electric arcs when a window meets the bar",
+            Toggle(settings.PlasmaEffect,v=>{settings.PlasmaEffect=v;settings.Save();}));
 
         // DESKTOPS
-        var desktops=Card("DESKTOPS");
-        Row(desktops,"Desktop bar",new[]{"Top","Bottom"},settings.DesktopStripPosition==DesktopStripPosition.Bottom?1:0,i=>{settings.DesktopStripPosition=i==1?DesktopStripPosition.Bottom:DesktopStripPosition.Top;settings.Save();layoutChanged();});
-        Row(desktops,"Soft animation",new[]{"On","Off"},settings.AnimateLayout?0:1,i=>{settings.AnimateLayout=i==0;settings.Save();});
-        Row(desktops,"Desktop transition",new[]{"Appear","Shift right","Shift left","Implode","Explode"},(int)settings.DesktopTransition,i=>{settings.DesktopTransition=(DesktopTransitionMode)i;settings.Save();},stacked:true);
-        body.Children.Add(desktops.Card);
+        var desktops=Section(body,"Desktops");
+        Setting(desktops,"Desktop bar position","Where the virtual desktop bar sits",
+            Segmented(new[]{"Top","Bottom"},settings.DesktopStripPosition==DesktopStripPosition.Bottom?1:0,i=>{settings.DesktopStripPosition=i==1?DesktopStripPosition.Bottom:DesktopStripPosition.Top;settings.Save();layoutChanged();}));
+        Setting(desktops,"Opening animation","Windows fly into place when the overview opens",
+            Toggle(settings.AnimateLayout,v=>{settings.AnimateLayout=v;settings.Save();}));
+        var transitionModes=new[]{DesktopTransitionMode.Slide,DesktopTransitionMode.Appear,DesktopTransitionMode.ShiftInRight,DesktopTransitionMode.ShiftInLeft,DesktopTransitionMode.Implode,DesktopTransitionMode.Explode};
+        Setting(desktops,"Desktop transition","Animation when switching desktops",
+            Segmented(new[]{"Slide","Appear","Shift right","Shift left","Implode","Explode"},Math.Max(0,Array.IndexOf(transitionModes,settings.DesktopTransition)),i=>{settings.DesktopTransition=transitionModes[i];settings.Save();},true),stacked:true);
 
-        // Quiet outlined Exit (the tray menu also exits).
-        var exit=new Button{Content="Exit Taskview++",HorizontalAlignment=HorizontalAlignment.Stretch,HorizontalContentAlignment=HorizontalAlignment.Center,
-            Height=36,Margin=new Thickness(0,4,0,0),CornerRadius=new CornerRadius(8),FontSize=13,BorderThickness=new Thickness(1),
-            BorderBrush=GlassAppearance.EdgeBrush(),Background=new SolidColorBrush(Microsoft.UI.Colors.Transparent),Foreground=GlassAppearance.SecondaryBrush()};
-        exit.Click+=(_,_)=>exitApp();
-        body.Children.Add(exit);
+        body.Children.Add(Footer());
 
         ApplyAppearance();
         FitToContent(header,body,scroller,windowScale,work);
     }
 
+    // Brand mark, title and subtitle; a quiet close button top-right.
+    Grid Header()
+    {
+        var header=new Grid{Padding=new Thickness(24,20,16,14),ColumnSpacing=14};
+        header.ColumnDefinitions.Add(new ColumnDefinition{Width=GridLength.Auto});
+        header.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(1,GridUnitType.Star)});
+        header.ColumnDefinitions.Add(new ColumnDefinition{Width=GridLength.Auto});
+        var mark=new Border{Width=36,Height=36,CornerRadius=new CornerRadius(9),VerticalAlignment=VerticalAlignment.Center,
+            Background=new LinearGradientBrush{StartPoint=new Windows.Foundation.Point(0,0),EndPoint=new Windows.Foundation.Point(1,1),
+                GradientStops={new GradientStop{Color=Windows.UI.Color.FromArgb(255,58,132,236),Offset=0},new GradientStop{Color=Windows.UI.Color.FromArgb(255,28,70,150),Offset=1}}},
+            Child=new TextBlock{Text="",FontFamily=Icons,FontSize=17,Foreground=new SolidColorBrush(Microsoft.UI.Colors.White),
+                HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Center}};
+        header.Children.Add(mark);
+        var titles=new StackPanel{VerticalAlignment=VerticalAlignment.Center,Spacing=0};
+        titles.Children.Add(new TextBlock{Text="Taskview++",FontFamily=Display,FontSize=20,FontWeight=Microsoft.UI.Text.FontWeights.SemiBold,Foreground=GlassAppearance.PrimaryBrush()});
+        titles.Children.Add(new TextBlock{Text="Settings",FontFamily=Text,FontSize=12,Foreground=GlassAppearance.SecondaryBrush()});
+        Grid.SetColumn(titles,1);header.Children.Add(titles);
+        var close=new Button{Content=new TextBlock{Text="",FontFamily=Icons,FontSize=10},Width=34,Height=34,Padding=new Thickness(0),
+            VerticalAlignment=VerticalAlignment.Top,CornerRadius=new CornerRadius(6),BorderThickness=new Thickness(0),
+            Background=new SolidColorBrush(Microsoft.UI.Colors.Transparent),Foreground=GlassAppearance.SecondaryBrush()};
+        ToolTipService.SetToolTip(close,"Close");
+        close.Click+=(_,_)=>Close();
+        Grid.SetColumn(close,2);header.Children.Add(close);
+        return header;
+    }
+
+    // A quiet Quit, centred at the bottom.
+    Button Footer()
+    {
+        var quit=new Button{Height=34,Padding=new Thickness(14,0,16,0),CornerRadius=new CornerRadius(6),BorderThickness=new Thickness(1),
+            HorizontalAlignment=HorizontalAlignment.Center,Margin=new Thickness(0,16,0,0),
+            BorderBrush=GlassAppearance.EdgeBrush(),Background=GlassAppearance.SurfaceBrush(PillOpacity),Foreground=GlassAppearance.PrimaryBrush()};
+        var content=new StackPanel{Orientation=Orientation.Horizontal,Spacing=8};
+        content.Children.Add(new TextBlock{Text="",FontFamily=Icons,FontSize=12,VerticalAlignment=VerticalAlignment.Center,
+            Foreground=new SolidColorBrush(Windows.UI.Color.FromArgb(255,255,140,140))});
+        content.Children.Add(new TextBlock{Text="Quit Taskview++",FontFamily=Text,FontSize=13,VerticalAlignment=VerticalAlignment.Center});
+        quit.Content=content;
+        quit.Click+=(_,_)=>exitApp();
+        return quit;
+    }
+
     void FitToContent(Grid header,StackPanel body,ScrollViewer scroller,double scale,Native.RECT work)
     {
         int maxWidth=Math.Max(1,work.Width-48),maxHeight=Math.Max(1,work.Height-48);
-        int width=Math.Min((int)Math.Round(540*scale),maxWidth);
+        int width=Math.Min((int)Math.Round(PanelWidth*scale),maxWidth);
         double widthDip=width/scale;
         // Measure the actual controls rather than sizing the window to a fixed historical
         // height. On normal displays the panel grows to exactly contain its settings, so
@@ -140,47 +176,53 @@ sealed class OptionsWindow : Window
         AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(x,y,width,height));
     }
 
-    static TextBlock Eyebrow(string text)=>new(){Text=text,FontSize=9,FontFamily=Mono,CharacterSpacing=60,Foreground=GlassAppearance.SecondaryBrush()};
-
-    // A glass card with an eyebrow title and a list of rows separated by hairlines.
-    sealed record Section(Border Card,StackPanel Rows);
-    static Section Card(string title)
+    // A titled group: the section name centred above a rounded card whose rows are split by hairlines.
+    static StackPanel Section(StackPanel body,string title)
     {
-        var rows=new StackPanel{Spacing=0};
-        var inner=new StackPanel{Spacing=8};
-        inner.Children.Add(Eyebrow(title));
-        inner.Children.Add(rows);
-        return new(GlassAppearance.Surface(inner,CardOpacity,12,new Thickness(16,12,16,10)),rows);
-    }
-    void AddRow(Section section,UIElement row)
-    {
-        if(section.Rows.Children.Count>0)
-            section.Rows.Children.Add(new Border{Height=1,Background=GlassAppearance.EdgeBrush(),Opacity=0.55,Margin=new Thickness(0,8,0,8)});
-        section.Rows.Children.Add(row);
+        body.Children.Add(new TextBlock{Text=title,FontFamily=Text,FontSize=14,FontWeight=Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground=GlassAppearance.PrimaryBrush(),HorizontalAlignment=HorizontalAlignment.Center,Margin=new Thickness(0,12,0,4)});
+        var rows=new StackPanel();
+        body.Children.Add(new Border{Child=rows,CornerRadius=new CornerRadius(8),BorderThickness=new Thickness(1),
+            BorderBrush=GlassAppearance.EdgeBrush(),Background=GlassAppearance.SurfaceBrush(CardOpacity)});
+        return rows;
     }
 
-    // Label left, segmented pill right; `stacked` puts a full-width pill under the label
-    // for option sets too long to sit inline.
-    void Row(Section section,string label,string[] labels,int selected,Action<int> changed,bool stacked=false)
+    // One setting: name and description on the left, control on the right (or underneath
+    // for wide option sets).
+    static void Setting(StackPanel rows,string name,string description,FrameworkElement control,bool stacked=false)
     {
-        var pill=Segmented(labels,selected,changed,stacked);
+        if(rows.Children.Count>0)
+            rows.Children.Add(new Border{Height=1,Background=GlassAppearance.EdgeBrush(),Opacity=.6,Margin=new Thickness(16,0,16,0)});
+        var labels=new StackPanel{Spacing=1,VerticalAlignment=VerticalAlignment.Center};
+        labels.Children.Add(new TextBlock{Text=name,FontFamily=Text,FontSize=14,Foreground=GlassAppearance.PrimaryBrush()});
+        labels.Children.Add(new TextBlock{Text=description,FontFamily=Text,FontSize=12,Foreground=GlassAppearance.SecondaryBrush(),TextWrapping=TextWrapping.Wrap});
         if(stacked)
         {
-            var col=new StackPanel{Spacing=7};
-            col.Children.Add(new TextBlock{Text=label,FontSize=13,Foreground=GlassAppearance.PrimaryBrush()});
-            col.Children.Add(pill);
-            AddRow(section,col);
+            var column=new StackPanel{Spacing=10,Padding=new Thickness(16,12,16,14)};
+            column.Children.Add(labels);
+            column.Children.Add(control);
+            rows.Children.Add(column);
             return;
         }
-        var grid=new Grid{ColumnSpacing=12};
+        var grid=new Grid{ColumnSpacing=16,Padding=new Thickness(16,11,12,11),MinHeight=60};
         grid.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(1,GridUnitType.Star)});
         grid.ColumnDefinitions.Add(new ColumnDefinition{Width=GridLength.Auto});
-        grid.Children.Add(new TextBlock{Text=label,FontSize=13,Foreground=GlassAppearance.PrimaryBrush(),VerticalAlignment=VerticalAlignment.Center});
-        Grid.SetColumn(pill,1);grid.Children.Add(pill);
-        AddRow(section,grid);
+        grid.Children.Add(labels);
+        control.VerticalAlignment=VerticalAlignment.Center;
+        Grid.SetColumn(control,1);grid.Children.Add(control);
+        rows.Children.Add(grid);
     }
 
-    static Border Segmented(string[] labels,int selected,Action<int> changed,bool stretch)
+    // Native Windows toggle, compact (no On/Off caption beside it).
+    static ToggleSwitch Toggle(bool value,Action<bool> changed)
+    {
+        var toggle=new ToggleSwitch{IsOn=value,OnContent=null,OffContent=null,MinWidth=0,Margin=new Thickness(0,0,-8,0)};
+        toggle.Toggled+=(_,_)=>changed(toggle.IsOn);
+        return toggle;
+    }
+
+    // Segmented choice: a recessed track with the selected option raised in accent blue.
+    static Border Segmented(string[] labels,int selected,Action<int> changed,bool stretch=false)
     {
         var track=new Grid{ColumnSpacing=2};
         var buttons=new List<Button>();
@@ -192,58 +234,25 @@ sealed class OptionsWindow : Window
                 bool on=i==selected;
                 buttons[i].Background=on?GlassAppearance.ButtonBlueActiveBrush():new SolidColorBrush(Microsoft.UI.Colors.Transparent);
                 buttons[i].Foreground=on?GlassAppearance.PrimaryBrush():GlassAppearance.SecondaryBrush();
+                buttons[i].FontWeight=on?Microsoft.UI.Text.FontWeights.SemiBold:Microsoft.UI.Text.FontWeights.Normal;
             }
         }
         for(int i=0;i<labels.Length;i++)
         {
             int index=i;
-            var b=new Button{Content=labels[i],Height=28,MinWidth=stretch?0:60,Padding=new Thickness(12,0,12,0),FontSize=12,
+            var b=new Button{Content=labels[i],Height=30,MinWidth=stretch?0:44,Padding=new Thickness(12,0,12,0),FontSize=12.5,FontFamily=Text,
                 HorizontalAlignment=HorizontalAlignment.Stretch,HorizontalContentAlignment=HorizontalAlignment.Center,
-                CornerRadius=new CornerRadius(6),BorderThickness=new Thickness(0)};
+                CornerRadius=new CornerRadius(5),BorderThickness=new Thickness(0)};
             b.Click+=(_,_)=>{selected=index;Paint();changed(index);};
             Grid.SetColumn(b,i);track.Children.Add(b);buttons.Add(b);
         }
         Paint();
-        return new Border{Child=track,Padding=new Thickness(2),CornerRadius=new CornerRadius(8),
+        return new Border{Child=track,Padding=new Thickness(3),CornerRadius=new CornerRadius(7),
             Background=GlassAppearance.SurfaceBrush(PillOpacity),BorderBrush=GlassAppearance.EdgeBrush(),BorderThickness=new Thickness(1),
             HorizontalAlignment=stretch?HorizontalAlignment.Stretch:HorizontalAlignment.Right};
     }
 
-    void SliderRow(Section section)
-    {
-        var col=new StackPanel{Spacing=2};
-        var header=new Grid();
-        header.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(1,GridUnitType.Star)});
-        header.ColumnDefinitions.Add(new ColumnDefinition{Width=GridLength.Auto});
-        header.Children.Add(new TextBlock{Text="Small window size",FontSize=13,Foreground=GlassAppearance.PrimaryBrush()});
-        var valueText=new TextBlock{Text=$"{settings.SmallWindowSize} DIP",FontSize=11,FontFamily=Mono,Foreground=GlassAppearance.SecondaryBrush(),VerticalAlignment=VerticalAlignment.Center};
-        Grid.SetColumn(valueText,1);header.Children.Add(valueText);
-        col.Children.Add(header);
-        var slider=new Slider{
-            Minimum=Settings.SmallWindowSizeMin,Maximum=Settings.SmallWindowSizeMax,
-            StepFrequency=10,TickFrequency=50,
-            SnapsTo=Microsoft.UI.Xaml.Controls.Primitives.SliderSnapsTo.StepValues,
-            Value=settings.SmallWindowSize,HorizontalAlignment=HorizontalAlignment.Stretch,Margin=new Thickness(0,-4,0,-6)};
-        slider.ValueChanged+=(_,e)=>{
-            int next=(int)Math.Round(e.NewValue/10d)*10;
-            next=Math.Clamp(next,Settings.SmallWindowSizeMin,Settings.SmallWindowSizeMax);
-            valueText.Text=$"{next} DIP";
-            if(settings.SmallWindowSize==next)return;
-            settings.SmallWindowSize=next;
-            sizeDirty=true;
-            sizeCommitTimer.Stop();sizeCommitTimer.Start();
-        };
-        col.Children.Add(slider);
-        AddRow(section,col);
-    }
-
     static int Nearest(int value,params int[] choices)=>Enumerable.Range(0,choices.Length).OrderBy(i=>Math.Abs(choices[i]-value)).First();
-    void CommitSize()
-    {
-        sizeCommitTimer.Stop();
-        if(!sizeDirty)return;
-        sizeDirty=false;settings.Save();tileSizeChanged();
-    }
     void SaveAppearance(){settings.Save();ApplyAppearance();appearanceChanged();}
     public void ApplyAppearance(){GlassAppearance.ApplyBackdrop(this,settings);root.Background=GlassAppearance.PanelBrush(settings);}
 }

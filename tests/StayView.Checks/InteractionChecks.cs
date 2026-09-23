@@ -45,20 +45,12 @@ static class InteractionChecks
             using var catalog=new WindowCatalog(new VirtualDesktopService());
             var monitor=Native.MonitorFromWindow(target,2);
             var group=catalog.Enumerate().Where(w=>w.Monitor==monitor && !(settings.DockMinimizedWindows && w.Minimized)).ToList();
+            // Enumeration is z-order, which is the Task View (most recently used) order.
             var sourceRects=group.Select(w=>Native.Placement(w.Handle).NormalPosition).ToList();
-            if(settings.KeepMinisSameSize)
-            {
-                var aspects=sourceRects.Select(r=>Math.Max(1,r.Width)/(double)Math.Max(1,r.Height)).Order().ToList();
-                var common=new Native.RECT(0,0,(int)Math.Round(Math.Clamp(aspects[aspects.Count/2],.6,2.2)*1000),1000);
-                sourceRects=Enumerable.Repeat(common,group.Count).ToList();
-            }
             var work=Native.WorkArea(monitor);double dpi=Native.MonitorScale(monitor);
             var area=Tiler.OverviewArea(work,8,dpi,settings.DesktopStripPosition);
-            int gap=(int)Math.Round(28*dpi),longEdge=(int)Math.Round(settings.SmallWindowSize*dpi);
-            var slots=settings.AutoArrange
-                ? ThumbnailLayout.GridCells(Tiler.OverviewArea(work,28,dpi,settings.DesktopStripPosition),settings.AutoArrangeGrid,group.Count,gap)
-                    .Take(group.Count).Select((cell,i)=>ThumbnailLayout.FitInCell(sourceRects[i],cell,longEdge)).ToList()
-                : ThumbnailLayout.ArrangeSources(sourceRects,area,gap,longEdge);
+            var canvas=Tiler.CanvasArea(work,dpi,settings.DesktopStripPosition);
+            var slots=TaskViewLayout.Layout(sourceRects,Native.MonitorBounds(monitor),new Native.RECT(work.Left,canvas.Top,work.Width,canvas.Height),dpi);
             var tile=slots[group.FindIndex(w=>w.Handle==target)];
             await Toggle(overlay);
             Assert(Native.IsWindowVisible(overlay),"overview opened");

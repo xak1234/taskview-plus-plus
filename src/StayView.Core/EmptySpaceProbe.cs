@@ -1,30 +1,176 @@
+using System.Diagnostics;
+using System.IO.Pipes;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Text;
 
 namespace StayView.Core;
 
-// UI Automation never runs in the global mouse hook or on the UI thread. Keep at
-// most one provider call in flight: a hung provider cannot accumulate workers.
-public sealed class EmptySpaceProbe
+// UI Automation never runs in the UI process. A provider call that hangs inside
+// UIAutomationCore's pipe transport (seen against Chrome) leaves the calling thread
+// in a kernel wait that process exit cannot interrupt: the process then lingers as
+// an unkillable zombie. Running the probe in a helper process keeps that risk out
+// of Taskview++ itself; a hung helper is abandoned and a fresh one is spawned.
+public sealed class EmptySpaceProbe : IDisposable
 {
+    const int Budget = 400;          // ms the UI waits for a verdict
+    const int RespawnDelay = 1500;   // ms before a failed helper is replaced
     int busy;
+    Process? process; NamedPipeClientStream? pipe; StreamReader? reader; StreamWriter? writer;
+    long retryAfter;
+    bool disabled;
     public string LastDecision { get; private set; } = "not checked";
-    bool Reject(string reason) { LastDecision=reason; return false; }
+    bool Reject(string reason) { LastDecision = reason; return false; }
+
+    bool Connect()
+    {
+        if(disabled)return false;
+        if (process != null && !process.HasExited && pipe?.IsConnected == true) return true;
+        if(!Drop())return false;
+        long now = Environment.TickCount64;
+        if (now < retryAfter) return false;
+        try
+        {
+            string name = "StayView.EmptySpace." + Guid.NewGuid().ToString("N");
+            process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--empty-space-probe " + name) { UseShellExecute = false, CreateNoWindow = true });
+            pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
+            pipe.Connect(1500);
+            reader = new(pipe); writer = new(pipe) { AutoFlush = true };
+            retryAfter = 0;
+            return true;
+        }
+        catch (Exception ex) { Log.Write("[probe] helper start failed: " + ex.Message); Drop(); retryAfter = now + RespawnDelay; return false; }
+    }
+
+    bool Drop()
+    {
+        try { writer?.Dispose(); } catch { } try { reader?.Dispose(); } catch { } try { pipe?.Dispose(); } catch { }
+        bool exited=true;
+        try
+        {
+            if(process!=null&&!process.HasExited)
+            {
+                process.Kill();
+                exited=process.WaitForExit(250);
+                if(!exited)
+                {
+                    disabled=true;
+                    Log.Write("[probe] helper could not terminate; disabling empty-space probing for this session");
+                }
+            }
+        }
+        catch(Exception ex)
+        {
+            exited=false;disabled=true;
+            Log.Write("[probe] helper shutdown failed; disabling probing: "+ex.Message);
+        }
+        try { process?.Dispose(); } catch { }
+        writer = null; reader = null; pipe = null; process = null;
+        return exited;
+    }
+
+    // Spawning and JIT-warming a helper costs ~300 ms; do it before the first click so a
+    // cold helper never eats the user's first empty-space double-click.
+    public void Warm() => _ = Task.Run(async () =>
+    {
+        if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
+        try
+        {
+            if (!Connect()) return;
+            await writer!.WriteLineAsync("0 0 0 0 0");
+            var read = reader!.ReadLineAsync();
+            if (await Task.WhenAny(read, Task.Delay(3000)) != read) { if(Drop())retryAfter = Environment.TickCount64 + RespawnDelay; }
+        }
+        catch (Exception ex) { Log.Write("[probe] warm-up failed: " + ex.Message); Drop(); }
+        finally { Volatile.Write(ref busy, 0); }
+    });
+
     public async Task<bool> IsEmptyAsync(nint window, Native.POINT first, Native.POINT second)
     {
         if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return false;
-        var query = Task.Run(() =>
+        try
         {
-            var dpi = Native.SetThreadDpiAwarenessContext(-4);
-            try { return IsEmpty(window, first) && ((first.X==second.X && first.Y==second.Y) || IsEmpty(window, second)); }
-            catch (Exception ex) { return Reject(ex.GetType().Name); } // Unknown accessibility preserves clicks.
-            finally { if(dpi!=0)Native.SetThreadDpiAwarenessContext(dpi); Volatile.Write(ref busy, 0); }
-        });
-        return await Task.WhenAny(query, Task.Delay(400)) == query && await query;
+            if (!Connect()) return Reject("probe helper unavailable");
+            Task<string?> read;
+            try
+            {
+                await writer!.WriteLineAsync($"{window} {first.X} {first.Y} {second.X} {second.Y}");
+                read = reader!.ReadLineAsync();
+            }
+            catch (Exception ex) { if(Drop())retryAfter = Environment.TickCount64 + RespawnDelay; return Reject("probe pipe: " + ex.GetType().Name); }
+            if (await Task.WhenAny(read, Task.Delay(Budget)) != read || read.Result == null)
+            {
+                Log.Write("[probe] helper timed out; terminating " + process?.Id);
+                bool stopped=Drop();
+                if(stopped)
+                {
+                    retryAfter = Environment.TickCount64 + RespawnDelay;
+                    _ = Task.Delay(RespawnDelay + 50).ContinueWith(_ => Warm());
+                }
+                return Reject("provider timeout");
+            }
+            var line = read.Result;
+            int sep = line.IndexOf('|');
+            LastDecision = sep >= 0 ? line[(sep + 1)..] : line;
+            return line.StartsWith("1", StringComparison.Ordinal);
+        }
+        finally { Volatile.Write(ref busy, 0); }
     }
 
-    bool IsEmpty(nint window, Native.POINT point)
+    public void Dispose() => Drop();
+}
+
+// Helper-process side. Each request runs on its own thread with the same budget the
+// UI uses; a request that overruns is abandoned inside this process, which keeps
+// serving later requests. Nothing here runs in the Taskview++ UI process.
+public static class EmptySpaceProbeServer
+{
+    public static void Run(string pipeName)
+    {
+        try
+        {
+            using var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.CurrentUserOnly);
+            var connection = pipe.WaitForConnectionAsync();
+            if (!connection.Wait(10000)) return;
+            using var reader = new StreamReader(pipe); using var writer = new StreamWriter(pipe) { AutoFlush = true };
+            var probe = new Probe();
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                string reply;
+                try
+                {
+                    var p = line.Split(' ');
+                    nint window = (nint)long.Parse(p[0]);
+                    var first = new Native.POINT { X = int.Parse(p[1]), Y = int.Parse(p[2]) };
+                    var second = new Native.POINT { X = int.Parse(p[3]), Y = int.Parse(p[4]) };
+                    var query = Task.Run(() =>
+                    {
+                        var dpi = Native.SetThreadDpiAwarenessContext(-4);
+                        try { return probe.IsEmpty(window, first) && ((first.X == second.X && first.Y == second.Y) || probe.IsEmpty(window, second)); }
+                        catch (Exception ex) { probe.LastDecision = ex.GetType().Name; return false; }
+                        finally { if (dpi != 0) Native.SetThreadDpiAwarenessContext(dpi); }
+                    });
+                    // Slightly longer than the client's budget so a fast answer always wins.
+                    reply = query.Wait(600) ? (query.Result ? "1|" : "0|") + probe.LastDecision : "0|provider timeout (helper)";
+                }
+                catch (Exception ex) { reply = "0|" + ex.GetType().Name; }
+                try { writer.WriteLine(reply); } catch (IOException) { break; }
+            }
+        }
+        catch (IOException) { /* UI process closed the pipe. */ }
+        catch (ObjectDisposedException) { }
+        // Do not return into WinUI teardown; a thread stuck in UIAutomationCore may keep
+        // this helper alive as a zombie, which is harmless here and never touches the UI process.
+        Environment.Exit(0);
+    }
+}
+
+sealed class Probe
+{
+    public string LastDecision = "not checked";
+    bool Reject(string reason) { LastDecision = reason; return false; }
+    public bool IsEmpty(nint window, Native.POINT point)
     {
         if (Native.GetAncestor(Native.WindowFromPoint(point), 2) != window) return Reject("different window under pointer");
         Native.GetWindowThreadProcessId(window, out var pid);

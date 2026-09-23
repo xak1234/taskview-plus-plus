@@ -1,0 +1,236 @@
+{
+  "Scenario": "uniform-10",
+  "ScreenWidth": 3840,
+  "ScreenHeight": 2160,
+  "Work": {
+    "Width": 3840,
+    "Height": 2112,
+    "Left": 0,
+    "Top": 0,
+    "Right": 3840,
+    "Bottom": 2112
+  },
+  "Scale": 1,
+  "Windows": [
+    {
+      "Index": 0,
+      "Colour": "255,0,0",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 40,
+        "Top": 40,
+        "Right": 1652,
+        "Bottom": 1033
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 341,
+        "Top": 206,
+        "Right": 1111,
+        "Bottom": 681
+      },
+      "Pixels": 365712,
+      "HeaderTop": 167
+    },
+    {
+      "Index": 1,
+      "Colour": "0,255,0",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 77,
+        "Top": 69,
+        "Right": 1689,
+        "Bottom": 1062
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 1933,
+        "Top": 206,
+        "Right": 2703,
+        "Bottom": 681
+      },
+      "Pixels": 365712,
+      "HeaderTop": 167
+    },
+    {
+      "Index": 2,
+      "Colour": "0,0,255",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 114,
+        "Top": 98,
+        "Right": 1726,
+        "Bottom": 1091
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 2729,
+        "Top": 206,
+        "Right": 3499,
+        "Bottom": 681
+      },
+      "Pixels": 365712,
+      "HeaderTop": 167
+    },
+    {
+      "Index": 3,
+      "Colour": "255,255,0",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 151,
+        "Top": 127,
+        "Right": 1763,
+        "Bottom": 1120
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 341,
+        "Top": 746,
+        "Right": 1111,
+        "Bottom": 1221
+      },
+      "Pixels": 365712,
+      "HeaderTop": 707
+    },
+    {
+      "Index": 4,
+      "Colour": "255,0,255",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 188,
+        "Top": 156,
+        "Right": 1800,
+        "Bottom": 1149
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 1137,
+        "Top": 746,
+        "Right": 1907,
+        "Bottom": 1221
+      },
+      "Pixels": 365712,
+      "HeaderTop": 707
+    },
+    {
+      "Index": 5,
+      "Colour": "0,255,255",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 225,
+        "Top": 185,
+        "Right": 1837,
+        "Bottom": 1178
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 1933,
+        "Top": 746,
+        "Right": 2703,
+        "Bottom": 1221
+      },
+      "Pixels": 365712,
+      "HeaderTop": 707
+    },
+    {
+      "Index": 6,
+      "Colour": "255,128,0",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 262,
+        "Top": 214,
+        "Right": 1874,
+        "Bottom": 1207
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 2729,
+        "Top": 746,
+        "Right": 3499,
+        "Bottom": 1221
+      },
+      "Pixels": 365712,
+      "HeaderTop": 707
+    },
+    {
+      "Index": 7,
+      "Colour": "128,0,255",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 299,
+        "Top": 243,
+        "Right": 1911,
+        "Bottom": 1236
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 1137,
+        "Top": 1286,
+        "Right": 1907,
+        "Bottom": 1761
+      },
+      "Pixels": 365712,
+      "HeaderTop": 1247
+    },
+    {
+      "Index": 8,
+      "Colour": "0,128,255",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 336,
+        "Top": 272,
+        "Right": 1948,
+        "Bottom": 1265
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 1933,
+        "Top": 1286,
+        "Right": 2703,
+        "Bottom": 1761
+      },
+      "Pixels": 365712,
+      "HeaderTop": 1247
+    },
+    {
+      "Index": 9,
+      "Colour": "255,0,128",
+      "Source": {
+        "Width": 1612,
+        "Height": 993,
+        "Left": 373,
+        "Top": 301,
+        "Right": 1985,
+        "Bottom": 1294
+      },
+      "Thumb": {
+        "Width": 770,
+        "Height": 475,
+        "Left": 1137,
+        "Top": 206,
+        "Right": 1907,
+        "Bottom": 681
+      },
+      "Pixels": 365712,
+      "HeaderTop": 167
+    }
+  ]
+}

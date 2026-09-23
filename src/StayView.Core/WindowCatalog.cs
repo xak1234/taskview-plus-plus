@@ -4,24 +4,27 @@ public sealed record AppWindow(nint Handle,string Title,nint Monitor,bool Minimi
 public sealed class WindowCatalog:IDisposable
 {
     readonly VirtualDesktopService desktops;
+    readonly Func<nint,bool>? include;
     readonly Native.WinEventProc callback;
     readonly List<nint> hooks=[];
     public event Action? ForegroundChanged;
     public event Action<nint, bool>? MoveSizeChanged;
     public event Action<nint, bool>? MinimizeChanged;
-    public WindowCatalog(VirtualDesktopService desktops) {
-        this.desktops=desktops;
-        // Only the foreground event is consumed (to keep the overview on top). Topology
-        // changes are picked up by the caller's 500 ms poll, so no broad object-event
-        // hook is installed: EVENT_OBJECT_LOCATIONCHANGE alone would wake this process
-        // on nearly every window move system-wide for no benefit.
-        callback=(_,ev,h,_,_,_,_)=>{
+    public event Action<nint>? LocationChanged;
+    public WindowCatalog(VirtualDesktopService desktops,Func<nint,bool>? include=null) {
+        this.desktops=desktops;this.include=include;
+        // LOCATIONCHANGE is filtered to OBJID_WINDOW and consumed only for browsed sources.
+        // It gives focused-window outlines a compositor-speed geometry signal and lets the
+        // native resize path enforce its configured minimum while the gesture is in flight.
+        callback=(_,ev,h,obj,_,_,_)=>{
             if(ev==3)ForegroundChanged?.Invoke();
             else if(ev is 10 or 11)MoveSizeChanged?.Invoke(h,ev==10);
             else if(ev is 0x16 or 0x17)MinimizeChanged?.Invoke(h,ev==0x16);
+            else if(ev==0x800B && obj==0 && h!=0)LocationChanged?.Invoke(h);
         };
         hooks.Add(Native.SetWinEventHook(3,3,0,callback,0,0,2));
         hooks.Add(Native.SetWinEventHook(10,11,0,callback,0,0,2)); // native move/resize start/end
+        hooks.Add(Native.SetWinEventHook(0x800B,0x800B,0,callback,0,0,2)); // EVENT_OBJECT_LOCATIONCHANGE
         // EVENT_SYSTEM_MINIMIZESTART / END. The start event lets StayView put its own
         // shrink-to-grid transition in front before Windows' taskbar minimize animation
         // becomes visible; the end event records the user's final iconic state.
@@ -51,6 +54,7 @@ public sealed class WindowCatalog:IDisposable
         if(!allDesktops)LastCurrent=enumCurrent;
         processNames.Clear();
         Native.EnumWindows((h,_)=>{
+            if(include!=null&&!include(h))return true;
             if(Reject(h,allDesktops,out var window)==null)result.Add(window!);
             return true;
         },0);

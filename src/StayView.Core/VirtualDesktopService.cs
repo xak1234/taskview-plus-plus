@@ -47,8 +47,18 @@ internal sealed class DirectVirtualDesktopService
     public bool Move(nint h,Guid id)=>Do(()=>{views!.GetViewForHwnd(h,out var view);try{manager!.MoveViewToDesktop(view,manager.FindDesktop(ref id));}finally{Marshal.ReleaseComObject(view);}});
     public bool Pin(nint h) {
         if(pinned==null||views==null)return false;
-        try { if(views.GetViewForHwnd(h,out var view)!=0)return false;try{pinned.PinView(view);return true;}finally{Marshal.ReleaseComObject(view);} }
-        catch(Exception ex){Log.Write("Pin overview: "+ex.Message);return false;}
+        try { if(views.GetViewForHwnd(h,out var view)!=0)return false;try{if(!pinned.IsViewPinned(view))pinned.PinView(view);return true;}finally{Marshal.ReleaseComObject(view);} }
+        catch(Exception ex){Log.Write("Pin window: "+ex.Message);return false;}
+    }
+    public bool IsPinned(nint h) {
+        if(pinned==null||views==null)return false;
+        try { if(views.GetViewForHwnd(h,out var view)!=0)return false;try{return pinned.IsViewPinned(view);}finally{Marshal.ReleaseComObject(view);} }
+        catch(Exception ex){Log.Write("Read window pin: "+ex.Message);return false;}
+    }
+    public bool Unpin(nint h) {
+        if(pinned==null||views==null)return false;
+        try { if(views.GetViewForHwnd(h,out var view)!=0)return false;try{if(pinned.IsViewPinned(view))pinned.UnpinView(view);return true;}finally{Marshal.ReleaseComObject(view);} }
+        catch(Exception ex){Log.Write("Unpin window: "+ex.Message);return false;}
     }
     public void MoveOwnWindow(nint h,Guid id){try{if(id!=Guid.Empty)standard?.MoveWindowToDesktop(h,ref id);}catch{}}
     static string RegistryName(Guid id)

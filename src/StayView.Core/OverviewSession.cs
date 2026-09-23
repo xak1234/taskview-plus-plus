@@ -7,13 +7,13 @@ namespace StayView.Core;
 // change where the real desktop window will live.
 public sealed class OverviewSession : IDisposable
 {
-    public readonly PlacementStore Placements = new();
+    public readonly PlacementStore Placements;
     readonly WindowCatalog catalog;
     readonly Settings settings;
     public readonly VirtualDesktopService Desktops;
     readonly Dictionary<nint, Native.RECT> positions = [];
     readonly Dictionary<nint, Native.RECT> currentCells = [];
-    readonly Dictionary<nint, int> gridAssignments = [];
+    readonly Dictionary<nint, int> arrangeOrder = [];
     readonly List<nint> docked = [];
     readonly Dictionary<nint, Native.RECT> settling = [];
     // A miniature drag is now a real desktop placement edit. Keep the source HWND hidden
@@ -24,19 +24,33 @@ public sealed class OverviewSession : IDisposable
     // reflow restores them behind the canvas to keep their thumbnails live, which clears
     // the very state the Dock minimized windows option keys off.
     readonly HashSet<nint> minimizedOnEntry = [];
-    // Windows explicitly minimized by the user while the overview is already open stay
-    // genuinely minimized. Restoring them only to feed DWM caused the real HWND to paint
-    // for a frame after the native minimize animation before it was lowered again.
+    // Semantic minimized state survives the no-activate restore used to keep DWM dock
+    // thumbnails live. DockView uses this instead of Native.IsIconic so only windows that
+    // are actually minimized in Taskview++ receive the minimized styling.
+    readonly HashSet<nint> minimizedDocked = [];
+    // Windows currently passing through a focused native minimize gesture. In StayView a
+    // focused minimize is a dock command: the shell is allowed to finish its minimize
+    // transition, then the source is restored non-activating behind the opaque overview so
+    // the dock keeps a live DWM source without changing the placement journal to minimized.
     readonly HashSet<nint> userMinimized = [];
+    readonly Dictionary<nint,(int Count,long Since)> restoreAttempts = [];
+    readonly HashSet<nint> selfMinimizing = [];
+    readonly HashSet<nint> restoredSinceAttempt = [];
     nint draggingTile;
     nint foreground;
-    int layoutSmallWindowSize;
+    Guid observedDesktop;
+    public Guid PreviousDesktop { get; private set; }
     public nint Selected { get; private set; }
     public bool Active { get; private set; }
     public bool DragActive => draggingTile != 0;
     public IReadOnlyList<nint> DockedSources => docked;
     public bool IsDocked(nint h) => docked.Contains(h);
+    public Func<nint,bool>? IsPinnedWindow { get; set; }
+    public Func<nint,bool>? KeepMinimized { get; set; }
+    public bool IsPinned(nint h) => IsPinnedWindow?.Invoke(h) == true;
+    public bool IsMinimizedDocked(nint h) => minimizedDocked.Contains(h);
     public int DesktopTransitionVersion { get; private set; }
+    public int DesktopTransitionDirection { get; private set; } = 1;
     public DesktopTransitionMode DesktopTransition { get; private set; } = DesktopTransitionMode.Appear;
     public event Action<IReadOnlyDictionary<nint, IReadOnlyList<Tile>>>? LayoutChanged;
     public event Action? Leaving;
@@ -46,21 +60,26 @@ public sealed class OverviewSession : IDisposable
     // window is on the old desktop, so the new desktop must show its grid, not stay
     // dropped behind windows for a window that is no longer here.
     public event Action? DesktopSwitched;
-    public OverviewSession(WindowCatalog catalog, VirtualDesktopService desktops, Settings settings)
-    { this.catalog = catalog; Desktops = desktops; this.settings = settings; layoutSmallWindowSize=settings.SmallWindowSize; }
+    public OverviewSession(WindowCatalog catalog, VirtualDesktopService desktops, Settings settings,PlacementStore? placements=null)
+    { this.catalog = catalog; Desktops = desktops; this.settings = settings; Placements=placements??new(); }
 
     public void Toggle() { if (Active) Exit(); else Enter(); }
     public void Enter()
     {
         if (Active) return;
         foreground = Native.GetForegroundWindow();
+        // Our own windows (the launch splash, options) are never the app to return to.
+        Native.GetWindowThreadProcessId(foreground, out var foregroundPid);
+        if (foregroundPid == Environment.ProcessId) foreground = 0;
         Selected = foreground;
         Active = true;
+        observedDesktop = Desktops.Current;
         // Must run before the first Reflow, which restores minimized sources.
         minimizedOnEntry.Clear();
+        minimizedDocked.Clear();
         userMinimized.Clear();
         foreach (var w in catalog.Enumerate())
-            if (w.Minimized || Native.IsIconic(w.Handle)) minimizedOnEntry.Add(w.Handle);
+            if (w.Minimized || Native.IsIconic(w.Handle)) { minimizedOnEntry.Add(w.Handle); minimizedDocked.Add(w.Handle); }
         ApplyDockMinimizedSetting();
         // Soft animation: the opening render flies each miniature in from its window's
         // real screen position, as Task View does. Signalled the same way a desktop
@@ -89,48 +108,23 @@ public sealed class OverviewSession : IDisposable
         // user changes virtual desktop. Ordinary canvas tiles still come strictly from
         // the current desktop below.
         var dockedWindows = all.Where(w => docked.Contains(w.Handle)).ToList();
-        foreach(var h in gridAssignments.Keys.Where(h=>!Native.IsWindow(h)).ToList())gridAssignments.Remove(h);
+        foreach(var h in arrangeOrder.Keys.Where(h=>!Native.IsWindow(h)).ToList())arrangeOrder.Remove(h);
         foreach(var h in positions.Keys.Where(h=>!Native.IsWindow(h)).ToList())positions.Remove(h);
         docked.RemoveAll(h=>!Native.IsWindow(h));
         var output = new Dictionary<nint, IReadOnlyList<Tile>>();
         currentCells.Clear();
         foreach (var m in Native.Monitors())
         {
-            var group = windows.Where(w => w.Monitor == m && !docked.Contains(w.Handle)).ToList();
             var work = Native.WorkArea(m);
             double dpi = Native.MonitorScale(m);
-            var area = Tiler.OverviewArea(work,28,dpi,settings.DesktopStripPosition);
-            var sourceRects=new List<Native.RECT>(group.Count);
-            foreach(var w in group)
-            {
-                if(Placements.Entries.TryGetValue(w.Handle,out var savedPlacement))sourceRects.Add(savedPlacement.Placement.NormalPosition);
-                else if(Native.GetWindowRect(w.Handle,out var source))sourceRects.Add(source);
-                else sourceRects.Add(new Native.RECT(0,0,16,10));
-            }
-            int longEdge=Math.Max(1,(int)Math.Round(settings.SmallWindowSize*dpi));
-            // Uniform tiles: every satellite is sized to one common box so the grid is
-            // even. All sizing uses a single shared aspect (the group's median, clamped),
-            // instead of each window's own aspect. Disable KeepMinisSameSize to fall back
-            // to per-window aspect-preserving sizes.
-            var sizingRects=sourceRects;
-            if(settings.KeepMinisSameSize && sourceRects.Count>0)
-            {
-                var aspects=sourceRects.Select(s=>Math.Max(1,s.Width)/(double)Math.Max(1,s.Height)).OrderBy(a=>a).ToList();
-                double commonAspect=Math.Clamp(aspects[aspects.Count/2],.6,2.2);
-                var common=new Native.RECT(0,0,(int)Math.Round(commonAspect*1000),1000);
-                sizingRects=Enumerable.Repeat(common,sourceRects.Count).ToList();
-            }
+            // Windows 11 Task View layout: same order, sizes, rows and gaps (TaskViewLayout).
+            var group = ArrangeOrder(windows.Where(w => w.Monitor == m && !docked.Contains(w.Handle)).ToList());
+            var slots = TaskViewCells(m, group);
             // The desktop strip is a hard no-drop zone. Manual positions are always
             // clamped to the legal canvas below it (or above it when the bar is at
             // the bottom), and never to the full work area.
             var canvasArea = Tiler.OverviewArea(work,8,dpi,settings.DesktopStripPosition);
-            // Task-View grid: keep a finger-width visual channel between panels on the
-            // initial/opening layout. Use DIPs so the gap remains visually consistent on
-            // high-DPI monitors. User-dragged tiles keep their explicitly chosen position.
-            int panelGap=Math.Max(1,(int)Math.Round(28*dpi));
-            var slots = settings.AutoArrange ? null : ThumbnailLayout.ArrangeSources(sizingRects, canvasArea, panelGap, longEdge);
-            var gridCells=settings.AutoArrange?ThumbnailLayout.GridCells(area,settings.AutoArrangeGrid,group.Count,panelGap):null;
-            if(gridCells!=null)EnsureGridAssignments(group,gridCells.Count);
+            int panelGap=TaskViewLayout.HorizontalGap(dpi);
             var tiles = new List<Tile>();
             var occupied = group.Where(w=>positions.ContainsKey(w.Handle))
                 .Select(w=>ThumbnailLayout.Clamp(positions[w.Handle],canvasArea)).ToList();
@@ -139,11 +133,7 @@ public sealed class OverviewSession : IDisposable
             {
                 var w = group[i];
                 Native.RECT cell;
-                if(settings.AutoArrange&&gridCells!=null)
-                {
-                    int slot=gridAssignments[w.Handle];
-                    cell=ThumbnailLayout.FitInCell(sizingRects[i],gridCells[slot],longEdge);
-                }
+                if(settings.AutoArrange)cell=slots[i];
                 else if(positions.TryGetValue(w.Handle,out var saved))
                 {
                     cell=ThumbnailLayout.Clamp(saved,canvasArea);
@@ -151,7 +141,7 @@ public sealed class OverviewSession : IDisposable
                 }
                 else
                 {
-                    cell=initialLayout ? slots![i] : StableTileLayout.PlaceNew(slots![i],occupied,canvasArea,panelGap);
+                    cell=initialLayout ? slots[i] : StableTileLayout.PlaceNew(slots[i],occupied,canvasArea,panelGap);
                     positions[w.Handle]=cell;
                     occupied.Add(cell);
                 }
@@ -179,6 +169,7 @@ public sealed class OverviewSession : IDisposable
     }
     public void MoveTile(nint h, Native.RECT rect)
     {
+        if(IsPinned(h))return;
         // Live drag remains canvas-only. The real desktop placement is committed once on
         // a successful drop, so moving a miniature never causes the hidden HWND to trail
         // the pointer or flash behind the overview.
@@ -193,6 +184,32 @@ public sealed class OverviewSession : IDisposable
     public void RestoreMinimizedSourceForOverview(nint h)
     {
         if (!Active || h == 0 || !Native.IsWindow(h) || !Native.IsIconic(h) || userMinimized.Contains(h)) return;
+        // Some apps (tray panels such as Windscribe) minimize themselves again whenever
+        // they lose focus. Restoring them every tick flashes their tile forever, so a window
+        // that re-minimizes three times within a few seconds is left minimized this session.
+        if (selfMinimizing.Contains(h)) return;
+        // A desktop remembers minimized status. Do not quietly restore those windows
+        // just so a thumbnail can update; coming back must still find them minimized.
+        if (KeepMinimized?.Invoke(h) == true) return;
+        // A global dock thumbnail is not permission to activate a foreign desktop.
+        // Unknown ownership also waits until the shell can positively identify it.
+        var current=Desktops.Current;
+        var owner=Desktops.WindowDesktop(h);
+        if(!IsPinned(h)&&(current==Guid.Empty || owner!=current))return;
+        // Count only real "restored, then minimized itself again" cycles: a slow app still
+        // restoring from the last request is not counted (see selfMinimizing above).
+        long now = Environment.TickCount64;
+        var (count, since) = restoreAttempts.GetValueOrDefault(h);
+        if (now - since > 8000) { count = 0; since = now; }   // a cycle spans ~2 ticks
+        if (restoredSinceAttempt.Remove(h)) count++;
+        if (count >= 3)
+        {
+            restoreAttempts.Remove(h);
+            selfMinimizing.Add(h);
+            Log.Write($"[restore] {Native.Title(h)} ({h}) keeps minimizing itself; leaving it minimized");
+            return;
+        }
+        restoreAttempts[h] = (count, since);
         // Some packaged/WinUI apps remain in a minimized-style presentation when asked
         // to SW_SHOWNOACTIVATE. Force a true normal restore using the placement journal's
         // normal rectangle so the DWM tile represents the real standard-sized app.
@@ -200,7 +217,7 @@ public sealed class OverviewSession : IDisposable
         {
             var p = saved.Placement;
             p.Length = System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>();
-            p.ShowCmd = 1; // SW_SHOWNORMAL
+            p.ShowCmd = 4; // SW_SHOWNOACTIVATE: passive DWM maintenance must not steal focus.
             p.NormalPosition = saved.Placement.NormalPosition;
             Native.SetWindowPlacement(h, ref p);
             // WINDOWPLACEMENT.NormalPosition is workspace-relative on some window styles;
@@ -210,7 +227,7 @@ public sealed class OverviewSession : IDisposable
         }
         else
         {
-            Native.ShowWindowAsync(h, 9); // SW_RESTORE fallback when no journal entry exists.
+            Native.ShowWindowAsync(h, 4); // SW_SHOWNOACTIVATE
             Native.SetWindowPos(h, 1, 0, 0, 0, 0, 0x13 | 0x4000);
         }
     }
@@ -218,11 +235,15 @@ public sealed class OverviewSession : IDisposable
     {
         ConfirmUserMinimizedSources();
         foreach (var w in windows)
+        {
             if (w.Minimized || Native.IsIconic(w.Handle)) RestoreMinimizedSourceForOverview(w.Handle);
+            // Seen restored after we asked: a later re-minimize is the app's own doing.
+            else if (restoreAttempts.ContainsKey(w.Handle)) restoredSinceAttempt.Add(w.Handle);
+        }
     }
     public void BeginTileDrag(nint h)
     {
-        if(Active && h != 0) draggingTile = h;
+        if(Active && h != 0 && !IsPinned(h)) { draggingTile = h; lastPreview = null; }
     }
     public void EndTileDrag(nint h = 0)
     {
@@ -231,18 +252,40 @@ public sealed class OverviewSession : IDisposable
     // Docking is canvas state only: the source HWND is never moved or minimised.
     public bool DockTile(nint h)
     {
-        if(!Active||h==0||draggingTile!=0||!Native.IsWindow(h))return false;
+        return DockTileCore(h,false);
+    }
+    bool DockTileCore(nint h,bool allowPinned)
+    {
+        if(!Active||h==0||draggingTile!=0||!Native.IsWindow(h)||(!allowPinned&&IsPinned(h)))return false;
         // Manual layout: pin every current cell (this tile's too) so docking/undocking
         // never repacks untouched tiles and an undocked tile returns to its old spot.
         if(!settings.AutoArrange)foreach(var pair in currentCells)positions.TryAdd(pair.Key,pair.Value);
         if(!docked.Contains(h))docked.Add(h);
-        gridAssignments.Remove(h);currentCells.Remove(h);
+        arrangeOrder.Remove(h);currentCells.Remove(h);
         Reflow();
         return true;
     }
+    // Membership only. The caller restores a whole desktop and reflows once.
+    public void ApplyDockState(nint h, bool dock, bool minimized)
+    {
+        if(!Active||h==0||!Native.IsWindow(h)||IsPinned(h))return;
+        if(dock)
+        {
+            if(!docked.Contains(h))docked.Add(h);
+            if(minimized)minimizedDocked.Add(h);else minimizedDocked.Remove(h);
+            arrangeOrder.Remove(h);
+            currentCells.Remove(h);
+        }
+        else
+        {
+            docked.Remove(h);
+            minimizedDocked.Remove(h);
+        }
+    }
+    public bool TryGetCanvasCell(nint h, out Native.RECT cell) => currentCells.TryGetValue(h, out cell);
     public bool UndockTile(nint h)
     {
-        if(!Active||!docked.Contains(h)||!Native.IsWindow(h))return false;
+        if(!Active||!docked.Contains(h)||!Native.IsWindow(h)||IsPinned(h))return false;
         // The dock follows the user between virtual desktops. Clicking a docked item still
         // has the existing click-to-undock meaning, but if that item belongs to a different
         // desktop first bring the real window to the desktop the user is currently on.
@@ -263,34 +306,82 @@ public sealed class OverviewSession : IDisposable
             }
         }
         docked.Remove(h);
+        minimizedDocked.Remove(h);
         // The user put this one back on the canvas themselves; a later settings change
         // must not silently re-dock it just because it opened minimized.
         minimizedOnEntry.Remove(h);
         Reflow();
         return true;
     }
+    // Where the other canvas tiles on the dragged tile's monitor move to while `h` is held
+    // at `rect` (Task View spacing, TileRepulsion). Nothing is committed.
+    public IReadOnlyDictionary<nint,Native.RECT> PreviewDrag(nint h,Native.RECT rect)
+    {
+        if(!Active||h==0)return new Dictionary<nint,Native.RECT>();
+        var probe=rect;
+        var monitor=Native.MonitorFromRect(ref probe,2);
+        if(monitor==0)return new Dictionary<nint,Native.RECT>();
+        double dpi=Native.MonitorScale(monitor);
+        var canvas=Tiler.OverviewArea(Native.WorkArea(monitor),8,dpi,settings.DesktopStripPosition);
+        var home=new Dictionary<nint,Native.RECT>();
+        foreach(var (source,cell) in currentCells)
+        {
+            if(source==h)continue;
+            var c=cell;
+            if(Native.MonitorFromRect(ref c,2)==monitor)home[source]=cell;
+        }
+        var pinned=home.Keys.Where(IsPinned).ToHashSet();
+        var (hGap,vGap,header)=TaskViewLayout.MinimumSpacing(dpi);
+        // The previous frame keeps each pushed neighbour escaping to the same side.
+        // The dragged tile's own cell is still its pre-drag home (committed only on drop).
+        Native.RECT? vacated=currentCells.TryGetValue(h,out var from)?from:null;
+        lastPreview=TileRepulsion.Resolve(h,rect,home,pinned,canvas,hGap,vGap,header,lastPreview,vacated);
+        return lastPreview;
+    }
+    Dictionary<nint,Native.RECT>? lastPreview;
     public void DropTile(nint h,Native.RECT rect,Native.RECT original)
     {
+        if(IsPinned(h))return;
+        // Manual layout: neighbours the drop pushed aside stay where they were pushed.
+        // They are canvas-only moves; only the dragged tile's real window is relocated.
+        // The dropped tile itself settles where it overlaps nothing (its old slot or the
+        // nearest free spot); if the canvas has no room at all the whole drop snaps back.
+        List<KeyValuePair<nint,Native.RECT>>? pushed=null;
+        bool settledElsewhere=false;
+        if(!settings.AutoArrange&&Active)
+        {
+            var preview=PreviewDrag(h,rect);
+            var probe=rect;var monitor=Native.MonitorFromRect(ref probe,2);
+            if(monitor!=0)
+            {
+                double dpi=Native.MonitorScale(monitor);
+                var canvas=Tiler.OverviewArea(Native.WorkArea(monitor),8,dpi,settings.DesktopStripPosition);
+                var (hGap,vGap,header)=TaskViewLayout.MinimumSpacing(dpi);
+                Native.RECT? origin=currentCells.TryGetValue(h,out var from)?from:null;
+                var settled=TileRepulsion.Settle(rect,origin,preview.Values,canvas,hGap,vGap,header);
+                if(settled is {} s)
+                {
+                    settledElsewhere=!s.Equals(rect);
+                    rect=s;
+                    pushed=preview.Where(p=>currentCells.TryGetValue(p.Key,out var home)&&!home.Equals(p.Value)).ToList();
+                }
+                else if(origin is {} back){settledElsewhere=true;rect=back;}
+            }
+        }
         MoveTile(h,rect);
+        if(pushed is {Count:>0})
+            foreach(var (source,cell) in pushed){positions[source]=cell;currentCells[source]=cell;}
+        if(pushed is {Count:>0}||settledElsewhere)Reflow();
+        lastPreview=null;
         Native.RECT final=rect;
         if(settings.AutoArrange&&Active)
         {
             var probe=rect;
             var monitor=Native.MonitorFromRect(ref probe,2);
             if(monitor==0)monitor=Native.MonitorFromWindow(h,2);
-            var group=catalog.Enumerate().Where(w=>w.Monitor==monitor&&!docked.Contains(w.Handle)).ToList();
+            var group=ArrangeOrder(catalog.Enumerate().Where(w=>w.Monitor==monitor&&!docked.Contains(w.Handle)).ToList());
             if(group.All(w=>w.Handle!=h)){Reflow();return;}
-            var work=Native.WorkArea(monitor);double dpi=Native.MonitorScale(monitor);
-            var area=Tiler.OverviewArea(work,28,dpi,settings.DesktopStripPosition);
-            int panelGap=Math.Max(1,(int)Math.Round(28*dpi));
-            var cells=ThumbnailLayout.GridCells(area,settings.AutoArrangeGrid,group.Count,panelGap);
-            EnsureGridAssignments(group,cells.Count);
-            int nearest=Enumerable.Range(0,cells.Count)
-                .OrderBy(i=>DistanceSquared(Center(rect),Center(cells[i]))).First();
-            int old=gridAssignments[h];
-            var occupant=group.FirstOrDefault(w=>w.Handle!=h&&gridAssignments.TryGetValue(w.Handle,out var slot)&&slot==nearest);
-            if(occupant!=null)gridAssignments[occupant.Handle]=old;
-            gridAssignments[h]=nearest;
+            MoveInOrder(group,h,NearestSlot(TaskViewCells(monitor,group),Center(rect)));
             positions.Remove(h);
             Reflow();
             if(currentCells.TryGetValue(h,out var snapped))final=snapped;
@@ -315,35 +406,49 @@ public sealed class OverviewSession : IDisposable
     }
     public void ApplyAutoArrangeSetting()
     {
-        if(settings.AutoArrange){positions.Clear();gridAssignments.Clear();}
+        if(settings.AutoArrange){positions.Clear();arrangeOrder.Clear();}
         else
         {
             positions.Clear();
             foreach(var pair in currentCells)positions[pair.Key]=pair.Value;
-            gridAssignments.Clear();
+            arrangeOrder.Clear();
         }
     }
-    public void ApplySmallWindowSizeSetting()
+    // Task View order is most-recently-used first. It is taken once from the z-order
+    // captured at session entry and then kept, so tiles do not reshuffle every time focus
+    // changes; windows that appear later join at the front, as they do in Task View.
+    List<AppWindow> ArrangeOrder(List<AppWindow> group)
     {
-        double ratio=settings.SmallWindowSize/(double)Math.Max(1,layoutSmallWindowSize);
-        foreach(var (h,r) in positions.ToList())
-            positions[h]=new(r.Left,r.Top,Math.Max(1,(int)Math.Round(r.Width*ratio)),Math.Max(1,(int)Math.Round(r.Height*ratio)));
-        layoutSmallWindowSize=settings.SmallWindowSize;
+        var fresh=group.Where(w=>!arrangeOrder.ContainsKey(w.Handle))
+            .OrderBy(w=>Placements.Entries.TryGetValue(w.Handle,out var saved)?saved.Z:-1).ToList();
+        int front=arrangeOrder.Count==0?0:arrangeOrder.Values.Min();
+        for(int i=0;i<fresh.Count;i++)arrangeOrder[fresh[i].Handle]=front-fresh.Count+i;
+        return group.OrderBy(w=>arrangeOrder[w.Handle]).ToList();
     }
-    void EnsureGridAssignments(IReadOnlyList<AppWindow> group,int slotCount)
+    void MoveInOrder(List<AppWindow> ordered,nint h,int index)
     {
-        var used=new HashSet<int>();
-        foreach(var w in group)
-        {
-            if(gridAssignments.TryGetValue(w.Handle,out var slot)&&slot>=0&&slot<slotCount&&used.Add(slot))continue;
-            gridAssignments.Remove(w.Handle);
-        }
-        foreach(var w in group.Where(w=>!gridAssignments.ContainsKey(w.Handle)))
-        {
-            int slot=Enumerable.Range(0,slotCount).First(i=>!used.Contains(i));
-            gridAssignments[w.Handle]=slot;used.Add(slot);
-        }
+        var handles=ordered.Select(w=>w.Handle).Where(x=>x!=h).ToList();
+        handles.Insert(Math.Clamp(index,0,handles.Count),h);
+        for(int i=0;i<handles.Count;i++)arrangeOrder[handles[i]]=i;
     }
+    // Task View thumbnail rectangles for `ordered` on a monitor, laid out in the canvas
+    // band that the desktop strip leaves free.
+    IReadOnlyList<Native.RECT> TaskViewCells(nint monitor,IReadOnlyList<AppWindow> ordered)
+    {
+        var work=Native.WorkArea(monitor);double dpi=Native.MonitorScale(monitor);
+        var canvas=Tiler.CanvasArea(work,dpi,settings.DesktopStripPosition);
+        var region=new Native.RECT(work.Left,canvas.Top,work.Width,canvas.Height);
+        var sources=new List<Native.RECT>(ordered.Count);
+        foreach(var w in ordered)
+        {
+            if(Placements.Entries.TryGetValue(w.Handle,out var saved))sources.Add(saved.Placement.NormalPosition);
+            else if(Native.GetWindowRect(w.Handle,out var source))sources.Add(source);
+            else sources.Add(new Native.RECT(0,0,16,10));
+        }
+        return TaskViewLayout.Layout(sources,Native.MonitorBounds(monitor),region,dpi);
+    }
+    static int NearestSlot(IReadOnlyList<Native.RECT> cells,Native.POINT point)=>
+        cells.Count==0?0:Enumerable.Range(0,cells.Count).OrderBy(i=>DistanceSquared(point,Center(cells[i]))).First();
     static Native.POINT Center(Native.RECT r)=>new(){X=r.Left+r.Width/2,Y=r.Top+r.Height/2};
     static long DistanceSquared(Native.POINT a,Native.POINT b){long dx=a.X-b.X,dy=a.Y-b.Y;return dx*dx+dy*dy;}
     // The Task-View action: bring the real window to the front at its true size and
@@ -352,6 +457,9 @@ public sealed class OverviewSession : IDisposable
     public bool Activate(nint h)
     {
         if (!Active || !Native.IsWindow(h)) return false;
+        var current=Desktops.Current;
+        var owner=Desktops.WindowDesktop(h);
+        if(!IsPinned(h)&&(current!=Guid.Empty && owner!=Guid.Empty ? owner!=current : !Desktops.IsCurrent(h)))return false;
         PrepareActivationGeometry(h);
         bool userIsRestoring = Placements.Entries.TryGetValue(h, out var savedBefore)
             && savedBefore.Placement.ShowCmd is 2 or 6 or 7;
@@ -368,6 +476,12 @@ public sealed class OverviewSession : IDisposable
             Native.ShowWindowAsync(h, 9);
             if(Native.IsIconic(h))return false;
         }
+        // The first geometry pass may have run while the HWND was still iconic.
+        PrepareActivationGeometry(h);
+        // Restore/placement APIs can legally produce a frame whose caption sits above the
+        // current work area (stale monitor topology, workspace offsets, or app self-moves).
+        // Correct it before foreground handoff so the focused title bar never appears offscreen.
+        EnsureActivationTopVisible(h);
         // Lift off the bottom of the z-order (overview keeps sources lowered) and focus.
         // A denied z-order request (e.g. an elevated console) must not prevent the
         // independent foreground request. Cross-thread activation completes asynchronously;
@@ -388,13 +502,15 @@ public sealed class OverviewSession : IDisposable
         // Focusing a previously minimized tile is a new explicit user state. Replace the
         // journal's old minimized show-state now that the real window is restored, so an
         // eventual StayView dismissal does not minimize it again behind the user's back.
-        if(userIsRestoring)
+        if(userIsRestoring || (tileMoved.Contains(h) && !Native.IsZoomed(h)))
         {
             Placements.Recapture(h);
+            tileMoved.Remove(h);
             minimizedOnEntry.Remove(h);
             docked.Remove(h);
         }
         userMinimized.Remove(h);
+        minimizedDocked.Remove(h);
         Selected = h;
         return true;
     }
@@ -409,53 +525,55 @@ public sealed class OverviewSession : IDisposable
     {
         if(!Active||!tileMoved.Contains(h)||!Native.IsWindow(h)
             ||!Placements.Entries.TryGetValue(h,out var saved))return;
-        if(Native.IsIconic(h)||Native.IsZoomed(h))
-        {
-            var p=Native.Placement(h);
-            p.Length=System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>();
-            p.NormalPosition=saved.Placement.NormalPosition;
-            Native.SetWindowPlacement(h,ref p);
-            return;
-        }
         // Position only: a tile drag must never resize the real window. Do this under the
         // opaque overview before its DWM miniature starts expanding, so the animation's
         // endpoint is the exact visible frame that will take over.
-        if(!Native.SetWindowPos(h,0,saved.Bounds.Left,saved.Bounds.Top,0,0,0x15))
+        if(!PlacementStore.ApplyPendingGeometry(h,saved))
             Log.Write($"Tile placement move failed for {h}: {System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
     }
-    // Reserve user-minimize intent as soon as Windows announces MINIMIZESTART. The native
-    // minimize has not necessarily reached WS_MINIMIZE yet, so do not touch the journal's
-    // ShowCmd here. This early marker exists to block the grid's passive DWM keepalive from
-    // restoring the HWND in the gap before EVENT_SYSTEM_MINIMIZEEND arrives.
+    public bool EnsureActivationTopVisible(nint h)
+    {
+        if(!Active || h==0 || !Native.IsWindow(h) || Native.IsIconic(h) || Native.IsZoomed(h)
+            || !Native.GetWindowRect(h,out var windowBounds) || !Native.TryGetVisualBounds(h,out var visualBounds))return false;
+        // Anchor the correction to the window's assigned monitor, not to the stray pixels.
+        // In stacked-monitor layouts an already-off-top frame can overlap the monitor above;
+        // MonitorFromRect would then legitimize the bad position by switching work areas.
+        var monitor=Native.MonitorFromWindow(h,2); // MONITOR_DEFAULTTONEAREST
+        if(monitor==0)return false;
+        var corrected=FocusedWindowGeometry.ClampVisibleTop(windowBounds,visualBounds,Native.WorkArea(monitor));
+        if(corrected.Equals(windowBounds))return false;
+        if(!Native.SetWindowPos(h,0,corrected.Left,corrected.Top,0,0,0x15))return false; // NOZORDER|NOSIZE|NOACTIVATE
+        Placements.UpdateGeometry(h);
+        return true;
+    }
+    // Focused native Minimize means "dock" while StayView is active. Establish the dock
+    // cell before the shrink animation starts, then reserve the source until Windows has
+    // completed its own minimize transition. The source is restored behind the overview at
+    // completion so the dock remains live; the journal deliberately stays non-minimized.
     public void BeginUserMinimize(nint h)
     {
         if(!Active || h==0 || !Native.IsWindow(h))return;
         userMinimized.Add(h);
-        docked.Remove(h);
+        minimizedDocked.Add(h);
+        DockTileCore(h,true);
     }
     public void CancelUserMinimize(nint h)
     {
         if(!Active || Native.IsIconic(h))return;
-        if(userMinimized.Remove(h) && Placements.Entries.TryGetValue(h,out var saved)
-            && saved.Placement.ShowCmd is 2 or 6 or 7)
-            Placements.Recapture(h);
+        userMinimized.Remove(h);
+        minimizedDocked.Remove(h);
     }
     public void NoteUserMinimized(nint h)
     {
         if(!Active || !Native.IsIconic(h))return;
-        Placements.MarkMinimized(h);
-        userMinimized.Add(h);
-        // A minimize performed while the overview is already active is a return-to-desktop
-        // action, not a dock action. Keep the source on the desktop/grid so ReconcileBrowse
-        // can re-summon the overview with its tile in the normal canvas. The dock-minimized
-        // setting applies only to windows that were already minimized when the session opened.
-        docked.Remove(h);
+        minimizedDocked.Add(h);
+        if(!docked.Contains(h))DockTileCore(h,true);
+        userMinimized.Remove(h);
+        RestoreMinimizedSourceForOverview(h);
     }
     // EVENT_SYSTEM_MINIMIZEEND is advisory rather than a transaction boundary: on some
-    // windows it can arrive late (or not at all) after the HWND is already iconic. Confirm
-    // reserved user-minimize intent from the normal grid maintenance path too. The show
-    // state write is idempotent and only performed when the journal has not yet recorded a
-    // minimized ShowCmd, so this does not turn the 500 ms timer into a disk-write loop.
+    // windows it can arrive late (or not at all). If the normal grid maintenance path sees
+    // the HWND become iconic first, finish the same minimize-to-dock conversion there.
     public void ConfirmUserMinimizedSources()
     {
         if(!Active)return;
@@ -463,9 +581,10 @@ public sealed class OverviewSession : IDisposable
         {
             if(!Native.IsWindow(h)){userMinimized.Remove(h);continue;}
             if(!Native.IsIconic(h))continue;
-            if(Placements.Entries.TryGetValue(h,out var saved)
-                && saved.Placement.ShowCmd is not (2 or 6 or 7))
-                Placements.MarkMinimized(h);
+            minimizedDocked.Add(h);
+            if(!docked.Contains(h))DockTile(h);
+            userMinimized.Remove(h);
+            RestoreMinimizedSourceForOverview(h);
         }
     }
     // A user RESIZE of the focused window is theirs to keep (edge/corner drag, maximize,
@@ -484,7 +603,10 @@ public sealed class OverviewSession : IDisposable
     //    journaling it would drop the window's minimized show-state.
     public void SyncUserGeometry(nint h, bool immediate = false)
     {
-        if (!Active || h == 0 || !Native.IsWindow(h) || Native.IsIconic(h)) { settling.Remove(h); return; }
+        // Pinned geometry is captured when the pin is created and is immutable until the
+        // pin is released. Never let the periodic resize journal race the restoration path
+        // and accidentally bless a transient app/self-initiated size change.
+        if (!Active || h == 0 || IsPinned(h) || !Native.IsWindow(h) || Native.IsIconic(h)) { settling.Remove(h); return; }
         if (!Placements.Entries.TryGetValue(h, out var saved) || !Native.GetWindowRect(h, out var now)) return;
         bool sizeChanged = now.Width != saved.Bounds.Width || now.Height != saved.Bounds.Height;
         var baseline = saved.Bounds;
@@ -498,18 +620,35 @@ public sealed class OverviewSession : IDisposable
         Placements.Recapture(h);
     }
     static bool Same(Native.RECT a, Native.RECT b) => a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom;
-    public bool MoveToDesktop(nint h, Guid id)
+    public bool MoveToDesktop(nint h, Guid id, Native.RECT? dropBounds=null)
     {
-        if (!Active || h == 0 || id == Guid.Empty || !Native.IsWindow(h)) return false;
+        if (!Active || h == 0 || id == Guid.Empty || !Native.IsWindow(h) || IsPinned(h)) return false;
+        if(!PlacementStore.TrySnapshot(h,0,Desktops.WindowDesktop(h),out var before))return false;
+        if(Placements.Capture(h,0,before.DesktopId))Placements.Persist();
         if (!Desktops.Move(h, id)) return false;
+        if(dropBounds is Native.RECT rect)
+        {
+            // A drag is explicit placement intent; normalize maximized/minimized windows
+            // without activation, then place the real window exactly once on release.
+            if(Native.IsIconic(h)||Native.IsZoomed(h))Native.ShowWindow(h,4);
+            if(Native.IsIconic(h)||!Native.SetWindowPos(h,0,rect.Left,rect.Top,rect.Width,rect.Height,0x14))
+            {
+                if(before.DesktopId!=Guid.Empty)Desktops.Move(h,before.DesktopId);
+                PlacementStore.RestoreOne(before,Desktops);
+                Log.Write("Desktop drop placement failed for "+h);
+                Reflow();return false;
+            }
+        }
         // The user explicitly moved this window to another desktop, so that desktop must
         // become part of its persisted session state rather than being undone on Exit().
         Placements.SetDesktop(h, id);
+        if(dropBounds!=null){Placements.Recapture(h);tileMoved.Remove(h);userMinimized.Remove(h);}
         docked.Remove(h);
+        minimizedDocked.Remove(h);
         minimizedOnEntry.Remove(h);
         positions.Remove(h);
         currentCells.Remove(h);
-        gridAssignments.Remove(h);
+        arrangeOrder.Remove(h);
         Reflow();
         return true;
     }
@@ -517,8 +656,35 @@ public sealed class OverviewSession : IDisposable
     {
         bool changed=change();
         if(!changed)return false;
-        DesktopChanged();
+        ObserveDesktopChange();
         return true;
+    }
+    public void PositionTransferredTile(nint h,Native.POINT point)
+    {
+        if(!Active||!currentCells.TryGetValue(h,out var cell))return;
+        var monitor=Native.MonitorFromWindow(h,2);
+        double dpi=Native.MonitorScale(monitor);
+        var area=Tiler.OverviewArea(Native.WorkArea(monitor),8,dpi,settings.DesktopStripPosition);
+        if(settings.AutoArrange)
+        {
+            var group=ArrangeOrder(catalog.Enumerate().Where(w=>w.Monitor==monitor&&!docked.Contains(w.Handle)).ToList());
+            MoveInOrder(group,h,NearestSlot(TaskViewCells(monitor,group),point));
+        }
+        else positions[h]=DesktopDropGeometry.AtPoint(cell,point,area);
+        Reflow();
+    }
+    // Both our desktop cards and Windows' own switching go through this boundary.
+    // Unknown broker results do not erase the last known desktop or create a switch.
+    public bool ObserveDesktopChange()
+    {
+        if(!Active)return false;
+        var current=Desktops.Current;
+        if(current==Guid.Empty || current==observedDesktop)return false;
+        bool changed=observedDesktop!=Guid.Empty;
+        if(changed)PreviousDesktop=observedDesktop;
+        observedDesktop=current;
+        if(changed)DesktopChanged();
+        return changed;
     }
     public bool RemoveDesktop(Guid id)
     {
@@ -533,7 +699,7 @@ public sealed class OverviewSession : IDisposable
         DesktopRemoved?.Invoke(id);
         var after=Desktops.Current;
         bool switched=before==id || (before!=Guid.Empty&&after!=Guid.Empty&&before!=after);
-        if(switched)DesktopChanged();
+        if(switched){PreviousDesktop=before;observedDesktop=after;DesktopChanged();}
         else if(Active)Reflow();
         return true;
     }
@@ -544,6 +710,10 @@ public sealed class OverviewSession : IDisposable
         // (window open/close, docking, monitor changes, removing an inactive desktop)
         // remain stable and never replay it.
         DesktopTransition=settings.DesktopTransition;
+        // Slide direction: +1 when the new desktop is to the right of the old one.
+        var order=Desktops.List().Select(d=>d.Id).ToList();
+        int from=order.IndexOf(PreviousDesktop),to=order.IndexOf(observedDesktop);
+        DesktopTransitionDirection=from>=0&&to>=0&&to<from?-1:1;
         DesktopTransitionVersion++;
         // Clear browse state (via the subscriber) BEFORE the reflow, so the new desktop's
         // grid renders topmost instead of staying dropped for a window left behind.
@@ -563,7 +733,7 @@ public sealed class OverviewSession : IDisposable
         var toMinimize = docked.Where(h => Native.IsWindow(h) && !Native.IsIconic(h)).ToList();
         // Restore behind the still-opaque canvas, then uncover the normal desktop.
         try { Placements.Restore(); foreach (var h in toMinimize) Native.ShowWindowAsync(h, 6); } // SW_MINIMIZE
-        finally { draggingTile=0; Leaving?.Invoke(); positions.Clear(); currentCells.Clear(); gridAssignments.Clear(); docked.Clear(); settling.Clear(); tileMoved.Clear(); minimizedOnEntry.Clear(); userMinimized.Clear(); Selected = 0; }
+        finally { draggingTile=0; Leaving?.Invoke(); positions.Clear(); currentCells.Clear(); arrangeOrder.Clear(); docked.Clear(); settling.Clear(); tileMoved.Clear(); minimizedOnEntry.Clear(); minimizedDocked.Clear(); userMinimized.Clear(); restoreAttempts.Clear(); selfMinimizing.Clear(); restoredSinceAttempt.Clear(); Selected = 0; }
         if (Native.IsWindow(foreground) && Desktops.IsCurrent(foreground)) Native.SetForegroundWindow(foreground);
     }
     public void Dispose() => Exit();
@@ -571,88 +741,11 @@ public sealed class OverviewSession : IDisposable
 
 public static class ThumbnailLayout
 {
-    public static IReadOnlyList<Native.RECT> GridCells(Native.RECT area,int grid,int count,int gap)
-    {
-        if(count<=0)return [];
-        grid=grid is 2 or 4 or 5?grid:4;gap=Math.Max(0,gap);
-        int rows=Math.Max(grid,(count+grid-1)/grid);
-        gap=Math.Min(gap,Math.Max(0,Math.Min(area.Width/Math.Max(1,grid*3),area.Height/Math.Max(1,rows*3))));
-        int width=Math.Max(1,(area.Width-gap*(grid-1))/grid);
-        int height=Math.Max(1,(area.Height-gap*(rows-1))/rows);
-        var result=new List<Native.RECT>(grid*rows);
-        for(int row=0;row<rows;row++)for(int col=0;col<grid;col++)
-            result.Add(new Native.RECT(area.Left+col*(width+gap),area.Top+row*(height+gap),width,height));
-        return result;
-    }
-    public static Native.RECT FitInCell(Native.RECT source,Native.RECT cell,int preferredLongEdge)
-    {
-        var (w,h)=SizeForSource(source,preferredLongEdge);
-        double fit=Math.Min(1,Math.Min(cell.Width/(double)Math.Max(1,w),cell.Height/(double)Math.Max(1,h)));
-        w=Math.Max(1,(int)Math.Round(w*fit));h=Math.Max(1,(int)Math.Round(h*fit));
-        return new(cell.Left+(cell.Width-w)/2,cell.Top+(cell.Height-h)/2,w,h);
-    }
     public static (int W,int H) SizeForSource(Native.RECT source,int longEdge)
     {
         int sw=Math.Max(1,source.Width),sh=Math.Max(1,source.Height);longEdge=Math.Max(1,longEdge);
         if(sw>=sh)return(longEdge,Math.Max(1,(int)Math.Round(longEdge*sh/(double)sw)));
         return(Math.Max(1,(int)Math.Round(longEdge*sw/(double)sh)),longEdge);
-    }
-    public static IReadOnlyList<Native.RECT> ArrangeSources(IReadOnlyList<Native.RECT> sources,Native.RECT area,int gap,int preferredLongEdge)
-    {
-        if(sources.Count==0)return [];
-        gap=Math.Max(0,gap);preferredLongEdge=Math.Max(1,preferredLongEdge);
-        double scale=1;
-        for(int attempt=0;attempt<24;attempt++)
-        {
-            var sizes=sources.Select(s=>SizeForSource(s,Math.Max(1,(int)Math.Round(preferredLongEdge*scale)))).ToList();
-            var rows=new List<List<(int Index,int W,int H)>>();
-            var row=new List<(int,int,int)>();int rowWidth=0;
-            for(int i=0;i<sizes.Count;i++)
-            {
-                var (w,h)=sizes[i];
-                int next=row.Count==0?w:rowWidth+gap+w;
-                if(row.Count>0&&next>area.Width){rows.Add(row);row=[];rowWidth=0;}
-                row.Add((i,w,h));rowWidth=row.Count==1?w:rowWidth+gap+w;
-            }
-            if(row.Count>0)rows.Add(row);
-            int totalHeight=rows.Sum(r=>r.Max(x=>x.H))+gap*Math.Max(0,rows.Count-1);
-            if(totalHeight<=area.Height && rows.All(r=>r.Sum(x=>x.W)+gap*Math.Max(0,r.Count-1)<=area.Width))
-            {
-                var result=new Native.RECT[sources.Count];
-                int y=area.Top+Math.Max(0,(area.Height-totalHeight)/2);
-                foreach(var r in rows)
-                {
-                    int rowW=r.Sum(x=>x.W)+gap*Math.Max(0,r.Count-1);
-                    int rowH=r.Max(x=>x.H),x=area.Left+Math.Max(0,(area.Width-rowW)/2);
-                    foreach(var item in r){result[item.Index]=new(x,y+(rowH-item.H)/2,item.W,item.H);x+=item.W+gap;}
-                    y+=rowH+gap;
-                }
-                return result;
-            }
-            scale*=Math.Clamp(area.Height/(double)Math.Max(1,totalHeight),.55,.92);
-        }
-        var fallback=Arrange(sources.Count,area,gap,preferredLongEdge,preferredLongEdge);
-        return sources.Select((source,i)=>FitInCell(source,fallback[i],preferredLongEdge)).ToList();
-    }
-    public static IReadOnlyList<Native.RECT> Arrange(int count, Native.RECT area, int gap, int maxWidth, int maxHeight)
-    {
-        if (count <= 0) return [];
-        int columns = Math.Min(count, Math.Max(1, (area.Width + gap) / (maxWidth + gap)));
-        int rows = (count + columns - 1) / columns;
-        // Shrink thumbnails, never their source windows, to keep the whole set visible.
-        while (rows * 90 + (rows - 1) * gap > area.Height && columns < count)
-        { columns++; rows = (count + columns - 1) / columns; }
-        gap = Math.Min(gap, Math.Max(0, Math.Min(area.Width / Math.Max(1, columns * 3), area.Height / Math.Max(1, rows * 3))));
-        int width = Math.Max(1, Math.Min(maxWidth, (area.Width - (columns - 1) * gap) / columns));
-        int height = Math.Max(1, Math.Min(maxHeight, (area.Height - (rows - 1) * gap) / rows));
-        var result = new List<Native.RECT>();
-        for (int i = 0; i < count; i++)
-        {
-            int row = i / columns, col = i % columns, inRow = Math.Min(columns, count - row * columns);
-            int x = area.Left + (area.Width - inRow * width - (inRow - 1) * gap) / 2 + col * (width + gap);
-            result.Add(new(x, area.Top + row * (height + gap), width, height));
-        }
-        return result;
     }
     // Left-aligned row of equal live minis. Every docked tile uses the same 16:9
     // rectangle so the dock reads as one consistent strip; the whole row shrinks

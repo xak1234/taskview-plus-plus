@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -29,6 +29,8 @@ public static class DesktopBroker
                         "moveDesktop"=>service.MoveDesktop(request.Id,request.Index),
                         "move"=>service.Move((nint)request.Handle,request.Id),
                         "pin"=>service.Pin((nint)request.Handle),
+                        "isPinned"=>service.IsPinned((nint)request.Handle),
+                        "unpin"=>service.Unpin((nint)request.Handle),
                         _=>false
                     };
                     writer.WriteLine(JsonSerializer.Serialize(result));
@@ -138,7 +140,10 @@ public sealed class VirtualDesktopService
     public bool IsCurrent(nint h){try{return standard?.IsWindowOnCurrentVirtualDesktop(h)??true;}catch{return true;}}
     public Guid WindowDesktop(nint h){try{return standard?.GetWindowDesktopId(h)??Guid.Empty;}catch{return Guid.Empty;}}
     public IReadOnlyList<DesktopInfo> List()=>BrokerCall<List<DesktopInfo>>(new("list"))??[];
-    public bool PinOwnWindow(nint h)=>BrokerCall<bool>(new("pin",Handle:h.ToInt64()));
+    public bool PinWindow(nint h)=>BrokerCall<bool>(new("pin",Handle:h.ToInt64()));
+    public bool IsWindowPinned(nint h)=>BrokerCall<bool>(new("isPinned",Handle:h.ToInt64()));
+    public bool UnpinWindow(nint h)=>BrokerCall<bool>(new("unpin",Handle:h.ToInt64()));
+    public bool PinOwnWindow(nint h)=>PinWindow(h);
     public bool Switch(Guid id)=>BrokerCall<bool>(new("switch",id));
     public bool Create()=>BrokerCall<bool>(new("create"));
     public bool Remove(Guid id)=>BrokerCall<bool>(new("remove",id));

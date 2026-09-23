@@ -1,0 +1,60 @@
+{
+  "Scenario": "wide-2",
+  "ScreenWidth": 3840,
+  "ScreenHeight": 2160,
+  "Work": {
+    "Width": 3840,
+    "Height": 2112,
+    "Left": 0,
+    "Top": 0,
+    "Right": 3840,
+    "Bottom": 2112
+  },
+  "Scale": 1,
+  "Windows": [
+    {
+      "Index": 0,
+      "Colour": "255,0,0",
+      "Source": {
+        "Width": 3072,
+        "Height": 648,
+        "Left": 40,
+        "Top": 40,
+        "Right": 3112,
+        "Bottom": 688
+      },
+      "Thumb": {
+        "Width": 1267,
+        "Height": 267,
+        "Left": 1933,
+        "Top": 746,
+        "Right": 3200,
+        "Bottom": 1013
+      },
+      "Pixels": 338252,
+      "HeaderTop": 707
+    },
+    {
+      "Index": 1,
+      "Colour": "0,255,0",
+      "Source": {
+        "Width": 3072,
+        "Height": 648,
+        "Left": 77,
+        "Top": 69,
+        "Right": 3149,
+        "Bottom": 717
+      },
+      "Thumb": {
+        "Width": 1267,
+        "Height": 267,
+        "Left": 640,
+        "Top": 746,
+        "Right": 1907,
+        "Bottom": 1013
+      },
+      "Pixels": 338251,
+      "HeaderTop": 707
+    }
+  ]
+}

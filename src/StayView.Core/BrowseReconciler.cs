@@ -20,22 +20,44 @@ public static class BrowseReconciler
     public static IReadOnlyList<nint> AvailableWindows(IEnumerable<nint> browsed, Func<nint, bool> available)
         => browsed.Where(h => h != 0 && available(h)).Distinct().ToArray();
 
-    // `foregroundIsOwnCanvas` is the case that makes tile-dragging-while-focused possible.
-    // Pressing a tile makes the overview HWND the foreground window, so after the gesture
-    // ends the selected window is no longer foreground. Treating that as "some window we do
-    // not tile" sends us to the grid and lowers every source — which is exactly the window
-    // the user was working in disappearing. Our own canvas is not a third-party window: the
-    // browse is still live, so restore the selected window rather than abandoning it.
+    // Pinned focused windows are outside the user's ordinary focus-window allowance.
+    // Preserve the existing focus order, keep every pinned handle, and apply the cap only
+    // to unpinned windows. This stays pure so settings changes and promotion ordering are
+    // testable without HWNDs.
+    public static IReadOnlyList<nint> LimitWithPinned(
+        IEnumerable<nint> ordered,
+        IReadOnlySet<nint> pinned,
+        int maxUnpinned)
+    {
+        maxUnpinned=Math.Max(0,maxUnpinned);
+        int unpinned=0;
+        var seen=new HashSet<nint>();
+        var result=new List<nint>();
+        foreach(var h in ordered)
+        {
+            if(h==0||!seen.Add(h))continue;
+            if(pinned.Contains(h)){result.Add(h);continue;}
+            if(unpinned++<maxUnpinned)result.Add(h);
+        }
+        return result;
+    }
+
+    // `foregroundIsOwnCanvas` alone is NOT enough reason to re-front the selected window.
+    // A browser/window that is closing naturally exposes the overview underneath it; if we
+    // blindly interpret that foreground change as a StayView gesture we can resurrect the
+    // closing HWND and bounce focus between it and the canvas. `ownCanvasGesture` is true
+    // only for a completed StayView tile drag that intentionally caused this handoff.
     public static BrowseTarget ClassifyForeground(
         nint selected,
         nint foreground,
         nint foregroundRoot,
         bool foregroundIsOwnCanvas,
+        bool ownCanvasGesture,
         nint foregroundSource)
     {
         if (foreground == 0) return BrowseTarget.Keep; // transient activation handoff
         if (selected != 0 && (foreground == selected || foregroundRoot == selected)) return BrowseTarget.Keep;
-        if (foregroundIsOwnCanvas) return BrowseTarget.Refront;
+        if (foregroundIsOwnCanvas) return ownCanvasGesture ? BrowseTarget.Refront : BrowseTarget.Grid;
         if (foregroundSource != 0 && foregroundSource != selected) return BrowseTarget.Follow;
         return BrowseTarget.Grid;
     }

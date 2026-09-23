@@ -1,0 +1,38 @@
+{
+  "Scenario": "tiny-1",
+  "ScreenWidth": 3840,
+  "ScreenHeight": 2160,
+  "Work": {
+    "Width": 3840,
+    "Height": 2112,
+    "Left": 0,
+    "Top": 0,
+    "Right": 3840,
+    "Bottom": 2112
+  },
+  "Scale": 1,
+  "Windows": [
+    {
+      "Index": 0,
+      "Colour": "255,0,0",
+      "Source": {
+        "Width": 384,
+        "Height": 302,
+        "Left": 40,
+        "Top": 40,
+        "Right": 424,
+        "Bottom": 342
+      },
+      "Thumb": {
+        "Width": 382,
+        "Height": 301,
+        "Left": 1729,
+        "Top": 746,
+        "Right": 2111,
+        "Bottom": 1047
+      },
+      "Pixels": 114944,
+      "HeaderTop": 707
+    }
+  ]
+}

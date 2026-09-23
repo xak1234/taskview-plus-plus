@@ -41,10 +41,19 @@ sealed class OverlayChrome : Window
     public nint FloatingPanel { get; set; }
     nint ZOrderTarget => FloatingPanel != 0 && Native.IsWindowVisible(FloatingPanel) ? FloatingPanel : -1;
     public bool IsDragging => tilesView.IsDragging;
+    public nint HitSource(Native.POINT screen)
+    {
+        if(!Native.IsWindowVisible(Handle)||!Native.GetWindowRect(Handle,out var bounds))return 0;
+        if(screen.X<bounds.Left||screen.X>=bounds.Right||screen.Y<bounds.Top||screen.Y>=bounds.Bottom)return 0;
+        return tilesView.HitSource(screen);
+    }
     public event Action? ToggleRequested;
     public event Action<int>? TrayMessage;
     public event Action<nint>? TileActivated;
+    public event Action<nint>? DockedTileClicked;
     public event Action<nint>? TileClose;
+    public event Action<nint>? TilePinToggle;
+    public event Action<nint>? PinGestureCompleted;
     public event Action<nint, Native.POINT>? TileDragMoved;
     public event Action? TileDragEnded;
     public event Action? OverviewPointerDown;
@@ -97,15 +106,19 @@ sealed class OverlayChrome : Window
         tilesView = new DockView(Handle, canvas, adornmentLayer, session, settings);
         tilesView.DockHover += over => stripBar.BorderBrush = over ? GlassAppearance.ActiveBrush() : GlassAppearance.StripEdgeBrush();
         tilesView.TileActivated += h => TileActivated?.Invoke(h);
+        tilesView.DockedTileClicked += h => DockedTileClicked?.Invoke(h);
         tilesView.BackgroundPressed += () => BackgroundPressed?.Invoke();
         tilesView.InteractionStarted += () => InteractionStarted?.Invoke();
         tilesView.TileDragStarted += () => TileDragStarted?.Invoke();
         tilesView.TileClose += h => TileClose?.Invoke(h);
+        tilesView.TilePinToggle += h => TilePinToggle?.Invoke(h);
+        tilesView.PinGestureCompleted += h => PinGestureCompleted?.Invoke(h);
         tilesView.TileDragMoved += (h,p) => TileDragMoved?.Invoke(h,p);
         tilesView.TileDragEnded += () => TileDragEnded?.Invoke();
-        switchTimer.Tick += (_, _) => { switchTimer.Stop(); var id = pendingSwitch; if (id != Guid.Empty) session.ChangeDesktop(() => session.Desktops.Switch(id)); };
+        cardZoomTimer.Tick += (_, _) => CardZoomTick();
+        switchTimer.Tick += (_, _) => { switchTimer.Stop(); var id = pendingSwitch; if (id != Guid.Empty) { bool ok=session.ChangeDesktop(() => session.Desktops.Switch(id)); Log.Write($"[desktop] card switch {id} -> {(ok?"ok":"FAILED")} now={session.Desktops.Current}"); } };
         ApplyAppearance();
-        Closed += (_, _) => { switchTimer.Stop(); tilesView.Dispose(); ClearDesktopThumbnails(); if (session.Active) session.Exit(); };
+        Closed += (_, _) => { StopCardZoom(); switchTimer.Stop(); tilesView.Dispose(); ClearDesktopThumbnails(); if (session.Active) session.Exit(); };
     }
     nint WndProc(nint h, uint msg, nint wp, nint lp)
     {
@@ -124,7 +137,7 @@ sealed class OverlayChrome : Window
                 // WinUI can raise this HWND after WM_MOUSEACTIVATE returns. Reveal the
                 // parked full-size DWM copies for that handoff turn so even a late raise
                 // cannot produce a blank hole before the posted z-order repair executes.
-                tilesView.ShowBrowseFallback(browsed,FocusedBrowsed());
+                tilesView.ShowBrowseFallback(browsed,FocusedBrowsed(),pinnedBrowsed);
                 Native.PostMessage(h, ReassertBrowseZOrderMessage, 0, 0);
             }
             return 3;
@@ -140,7 +153,7 @@ sealed class OverlayChrome : Window
             // Leave the parked full-size copies visible until the posted pass. WinUI may
             // complete activation AFTER this callback and raise the canvas again; suppressing
             // them here would reopen the exact one-frame blank-hole race we are guarding.
-            tilesView.ShowBrowseFallback(browsed,FocusedBrowsed());
+            tilesView.ShowBrowseFallback(browsed,FocusedBrowsed(),pinnedBrowsed);
             // Doing this only inside WM_ACTIVATE is racy: Windows/WinUI may complete the
             // activation after our SetWindowPos and raise the opaque canvas again. The
             // posted pass is authoritative once activation has actually completed.
@@ -181,6 +194,9 @@ sealed class OverlayChrome : Window
         adornmentLayer.Width=canvas.Width;adornmentLayer.Height=canvas.Height;
         backdropLayer.Width=canvas.Width;backdropLayer.Height=canvas.Height;
         BuildDesktopStrip();
+        // A zoom ended by the rebuild recomposed into the OLD card positions; force the
+        // recompose below onto the new ones.
+        pictureSignature = "";
         var options = new Button { Content = "⚙", Width=36, Height=32, Padding=new Thickness(0),
             Background = GlassAppearance.SurfaceBrush2(settings.GlassOpacity), Foreground = GlassAppearance.PrimaryBrush(),
             CornerRadius = new CornerRadius(7), BorderThickness=new Thickness(0) };
@@ -238,19 +254,24 @@ sealed class OverlayChrome : Window
     // the overview over that window or lowers it to the bottom of the z-order.
     // Up to two windows browsed in front of this overview, primary (foreground) first.
     readonly List<nint> browsed = new();
+    readonly HashSet<nint> pinnedBrowsed = new();
     string browseGuardSignature = "";
     public void SetBrowsedSource(nint source) => SetBrowsed(source == 0 ? Array.Empty<nint>() : new[] { source });
     public Task AnimateWindowsAsync(IReadOnlyDictionary<nint, Native.RECT> bounds, bool expanding)
         => tilesView.AnimateWindowsAsync(bounds, expanding);
     public void CancelWindowAnimation() => tilesView.CancelWindowAnimation();
     public void CommitWindowAnimation() => tilesView.CommitWindowAnimation();
-    public void SetBrowsed(IReadOnlyList<nint> sources)
+    public void ShowExternalDragPreview(nint source,Native.POINT point)=>tilesView.ShowExternalDragPreview(source,point);
+    public void ClearExternalDragPreview()=>tilesView.ClearExternalDragPreview();
+    public void SetBrowsed(IReadOnlyList<nint> sources,IReadOnlyCollection<nint>? pinnedSources=null)
     {
-        browsed.Clear(); browsed.AddRange(sources.Where(s => s != 0).Distinct().Take(Settings.MaxBrowsedWindowsMax));
+        browsed.Clear(); browsed.AddRange(sources.Where(s => s != 0).Distinct());
+        pinnedBrowsed.Clear();
+        if(pinnedSources!=null)pinnedBrowsed.UnionWith(pinnedSources.Where(browsed.Contains));
         if(browsed.Count==0)
         {
             browseGuardSignature="";
-            tilesView.SetBrowsePresentation(browsed,browsed,0);
+            tilesView.SetBrowsePresentation(browsed,browsed,0,pinnedBrowsed);
             return;
         }
         KeepBelowBrowsed();
@@ -260,6 +281,11 @@ sealed class OverlayChrome : Window
         if (browsed.Count == 0 || !Native.IsWindowVisible(Handle)) return;
         KeepBelowBrowsed();
         Native.PostMessage(Handle, ReassertBrowseZOrderMessage, 0, 0);
+    }
+    public void RefreshBrowseGeometry()
+    {
+        if (browsed.Count == 0 || !Native.IsWindowVisible(Handle)) return;
+        tilesView.RefreshBrowseGeometry(browsed,FocusedBrowsed(),pinnedBrowsed);
     }
     nint FocusedBrowsed()
     {
@@ -280,27 +306,39 @@ sealed class OverlayChrome : Window
         if (browsed.Count == 0) return;
         if (!Native.IsWindowVisible(Handle))
         {
-            tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),FocusedBrowsed());
+            tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),FocusedBrowsed(),pinnedBrowsed);
             return;
         }
         var live = browsed.Where(s=>Native.IsWindow(s)&&Native.IsWindowVisible(s)&&!Native.IsIconic(s)).ToList();
         if (live.Count == 0)
         {
-            tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),0);
+            tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),0,pinnedBrowsed);
             return;
         }
         if (presenter.IsAlwaysOnTop) presenter.IsAlwaysOnTop = false;
-        // Find the lowest browsed source in the CURRENT OS z-order, then insert the canvas
-        // directly beneath it. This preserves whichever source the user just clicked/moved.
-        var lowest=live[0];
-        for(int i=1;i<live.Count;i++)if(Native.IsAbove(lowest,live[i]))lowest=live[i];
-        Native.SetWindowPos(Handle, lowest, 0, 0, 0, 0, 0x13);
+        // Never let the canvas join the topmost band. Pinned windows are HWND_TOPMOST; inserting
+        // the canvas directly below a pin put the canvas itself in that band, so the next click
+        // on it (making it foreground) lifted it ABOVE the pins - the real pin vanished behind
+        // the overview, only its thumbnail fallback showed, and clicks on that re-fronted
+        // windows in a loop. The canvas leaves the band and sits below the lowest NORMAL
+        // browsed source; pins stay above it by being topmost.
+        if ((Native.GetWindowLongPtr(Handle, -20).ToInt64() & 8) != 0)
+            Native.SetWindowPos(Handle, -2, 0, 0, 0, 0, 0x13); // HWND_NOTOPMOST
+        var normal = live.Where(s => (Native.GetWindowLongPtr(s, -20).ToInt64() & 8) == 0).ToList();
+        if (normal.Count > 0)
+        {
+            // Find the lowest browsed source in the CURRENT OS z-order, then insert the canvas
+            // directly beneath it. This preserves whichever source the user just clicked/moved.
+            var lowest = normal[0];
+            for (int i = 1; i < normal.Count; i++) if (Native.IsAbove(lowest, normal[i])) lowest = normal[i];
+            Native.SetWindowPos(Handle, lowest, 0, 0, 0, 0, 0x13);
+        }
 
         // Hard invariant: a miniature is suppressed only if its real source is demonstrably
         // above this opaque overview RIGHT NOW. If Windows/WinUI is still settling z-order,
         // leave that miniature visible at the real HWND rectangle until the posted retry.
         var safe=live.Where(s=>Native.IsAbove(s,Handle)).ToList();
-        tilesView.SetBrowsePresentation(browsed,safe,FocusedBrowsed());
+        tilesView.SetBrowsePresentation(browsed,safe,FocusedBrowsed(),pinnedBrowsed);
         var unsafeSources=live.Where(s=>!safe.Contains(s)).ToList();
         var signature=string.Join(",",unsafeSources);
         if(signature!=browseGuardSignature)
@@ -320,15 +358,24 @@ sealed class OverlayChrome : Window
     }
     void BuildDesktopStrip()
     {
+        StopCardZoom();
+        cardGeometry.Clear();
         pictures.Clear();
         desktopCards.Clear();
         var desktops = session.Desktops.List();
         if (desktops.Count == 0) desktops = [new(session.Desktops.Current, "Current desktop", true)];
         bool canCreateDesktop=session.Desktops.Available;
-        int cardCount=desktops.Count+(canCreateDesktop?1:0);
-        double gap = 28, available = Math.Max(1, canvas.Width - 48);
-        double width = Math.Min(242, Math.Max(28, (available - (cardCount - 1) * gap) / cardCount));
-        double height = width * 9 / 16, left = (canvas.Width - cardCount * width - (cardCount - 1) * gap) / 2;
+        double gap = 28;
+        var addLabel=new TextBlock { Text="NEW DESKTOP",FontSize=7,
+            FontFamily=new FontFamily("Cascadia Mono, Consolas"),CharacterSpacing=60,
+            Foreground=GlassAppearance.SecondaryBrush(),TextAlignment=TextAlignment.Center };
+        addLabel.Measure(new Windows.Foundation.Size(double.PositiveInfinity,double.PositiveInfinity));
+        double requestedAddWidth=Math.Max(28,Math.Ceiling(addLabel.DesiredSize.Width));
+        // Desktops sit snug against the centred + card (tiny gap); desktops keep the wider gap between each other.
+        const double AddCardGap=6;
+        var stripLayout=Tiler.DesktopStripLayout(desktops.Count,canCreateDesktop,canvas.Width,gap,requestedAddWidth,AddCardGap);
+        double width=stripLayout.CardWidth,addWidth=stripLayout.AddWidth;
+        double height = width * 9 / 16;
         double cardTop=settings.DesktopStripPosition==DesktopStripPosition.Bottom?Math.Max(20,canvas.Height-height-22):20;
         double labelTop=settings.DesktopStripPosition==DesktopStripPosition.Bottom?cardTop-16:cardTop+height+7;
         // Full-width glass bar behind the cards, inside the strip's no-drop reservation.
@@ -342,14 +389,37 @@ sealed class OverlayChrome : Window
         // is the clear channel that keeps the nearest docked mini off the cards.
         const double CardGap=96;
         double dockOuter=settings.DesktopStripPosition==DesktopStripPosition.Top?62:20;
-        double cardsRight=left+cardCount*width+(cardCount-1)*gap;
+        double cardsLeft=stripLayout.GroupLeft,cardsRight=stripLayout.GroupRight;
         int laneTop=work.Top+(int)Math.Round(cardTop*scale),laneHeight=(int)Math.Round(height*scale);
         tilesView.SetStrip(
             new Native.RECT(work.Left+(int)Math.Round(8*scale),work.Top+(int)Math.Round(barTop*scale),(int)Math.Round(stripBar.Width*scale),(int)Math.Round(stripBar.Height*scale)),
-            new Native.RECT(work.Left+(int)Math.Round(dockOuter*scale),laneTop,Math.Max(0,(int)Math.Round((left-CardGap-dockOuter)*scale)),laneHeight),
+            new Native.RECT(work.Left+(int)Math.Round(dockOuter*scale),laneTop,Math.Max(0,(int)Math.Round((cardsLeft-CardGap-dockOuter)*scale)),laneHeight),
             new Native.RECT(work.Left+(int)Math.Round((cardsRight+CardGap)*scale),laneTop,Math.Max(0,(int)Math.Round((canvas.Width-dockOuter-CardGap-cardsRight)*scale)),laneHeight));
+        if(canCreateDesktop)
+        {
+            var plus=new TextBlock {
+                Text="+",FontSize=Math.Clamp(width*.28,22,52),FontWeight=Microsoft.UI.Text.FontWeights.Light,
+                Foreground=GlassAppearance.PrimaryBrush(),HorizontalAlignment=HorizontalAlignment.Center,
+                VerticalAlignment=VerticalAlignment.Center,TextAlignment=TextAlignment.Center
+            };
+            var addCard=new Border {
+                Width=addWidth,Height=height,Child=plus,CornerRadius=new CornerRadius(9),
+                BorderThickness=new Thickness(2),BorderBrush=GlassAppearance.EdgeBrush(),
+                Background=GlassAppearance.SurfaceBrush2(Math.Max(35,settings.GlassOpacity-20))
+            };
+            AutomationPropertiesName(addCard,"New desktop");
+            addCard.Tapped+=(_,e)=>{
+                switchTimer.Stop();pendingSwitch=Guid.Empty;e.Handled=true;
+                session.ChangeDesktop(()=>session.Desktops.Create());
+            };
+            // The + card speaks for itself; no caption under it. (The label is still
+            // measured above only to keep the card's established width.)
+            Add(addCard,stripLayout.AddLeft,cardTop);
+        }
+
         for (int desktopIndex=0; desktopIndex<desktops.Count; desktopIndex++)
         {
+            double left=stripLayout.DesktopLefts[desktopIndex];
             var desktop=desktops[desktopIndex];
             var picture = new Grid {
                 Background = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 26, 32, 44)), CornerRadius = new CornerRadius(8) };
@@ -375,7 +445,7 @@ sealed class OverlayChrome : Window
             card.Tapped += (_, _) => {
                 switchTimer.Stop();pendingSwitch=Guid.Empty;
                 if (target.Current || target.Id == session.Desktops.Current) return;
-                session.ChangeDesktop(() => session.Desktops.Switch(target.Id));
+                { bool ok=session.ChangeDesktop(() => session.Desktops.Switch(target.Id)); Log.Write($"[desktop] card click switch {target.Id} -> {(ok?"ok":"FAILED")} now={session.Desktops.Current}"); }
             };
             // Right-click is now the direct popout gesture for an alternate desktop.
             // Mark it handled so WinUI does not also open the old context flyout.
@@ -389,35 +459,20 @@ sealed class OverlayChrome : Window
                 card.ContextFlyout = DesktopMenu(target,desktopIndex,desktops.Count);
             Add(card, left, cardTop);
             // Tiny uppercase monospace (terminal) label under/over each desktop card.
-            Add(new TextBlock { Text = desktop.Name.ToUpperInvariant(), FontSize = 7,
+            var label = new TextBlock { Text = desktop.Name.ToUpperInvariant(), FontSize = 7,
                 FontFamily = new FontFamily("Cascadia Mono, Consolas"), CharacterSpacing = 60,
                 Foreground = GlassAppearance.SecondaryBrush(),
-                Width = width, TextAlignment = TextAlignment.Center }, left, labelTop);
+                Width = width, TextAlignment = TextAlignment.Center };
+            Add(label, left, labelTop);
+            // Hover zoom (see CardHover).
+            if (target.Id != Guid.Empty)
+            {
+                cardGeometry[target.Id] = (card, label, left, cardTop, width, height, desktop);
+                card.PointerEntered += (_, _) => { if (!IsDragging) CardHover(target.Id); };
+                card.PointerExited += (_, _) => { if (cardZoomPending == target.Id || cardZoomId == target.Id) CardHover(Guid.Empty); };
+            }
             pictures.Add((desktop, new Native.RECT(work.Left + (int)((left + 2) * scale), work.Top + (int)((cardTop+2) * scale),
                 Math.Max(1, (int)((width - 4) * scale)), Math.Max(1, (int)((height - 4) * scale)))));
-            left += width + gap;
-        }
-        if(canCreateDesktop)
-        {
-            var plus=new TextBlock {
-                Text="+",FontSize=Math.Clamp(width*.28,22,52),FontWeight=Microsoft.UI.Text.FontWeights.Light,
-                Foreground=GlassAppearance.PrimaryBrush(),HorizontalAlignment=HorizontalAlignment.Center,
-                VerticalAlignment=VerticalAlignment.Center,TextAlignment=TextAlignment.Center
-            };
-            var addCard=new Border {
-                Width=width,Height=height,Child=plus,CornerRadius=new CornerRadius(9),
-                BorderThickness=new Thickness(2),BorderBrush=GlassAppearance.EdgeBrush(),
-                Background=GlassAppearance.SurfaceBrush2(Math.Max(35,settings.GlassOpacity-20))
-            };
-            AutomationPropertiesName(addCard,"New desktop");
-            addCard.Tapped+=(_,e)=>{
-                switchTimer.Stop();pendingSwitch=Guid.Empty;e.Handled=true;
-                session.ChangeDesktop(()=>session.Desktops.Create());
-            };
-            Add(addCard,left,cardTop);
-            Add(new TextBlock { Text="NEW DESKTOP",FontSize=7,
-                FontFamily=new FontFamily("Cascadia Mono, Consolas"),CharacterSpacing=60,
-                Foreground=GlassAppearance.SecondaryBrush(),Width=width,TextAlignment=TextAlignment.Center },left,labelTop);
         }
     }
     public void FlashDesktopCard(Guid id)
@@ -487,21 +542,32 @@ sealed class OverlayChrome : Window
         var screen = Native.MonitorBounds(Native.MonitorFromWindow(Handle, 2));
         var live = new HashSet<nint>();
         foreach (var (desktop, picture) in pictures)
-        {
+            ComposeDesktop(desktop, desktop.Id == cardZoomId && cardZoomPicture is { } zoomed ? zoomed : picture, windows, screen, live);
+        // Drop only the previews whose source is no longer shown (closed, minimized, moved
+        // to another desktop, or off-screen), leaving every reused registration in place.
+        foreach (var gone in desktopThumbBySource.Keys.Where(k => !live.Contains(k)).ToList())
+        { Native.DwmUnregisterThumbnail(desktopThumbBySource[gone]); desktopThumbBySource.Remove(gone); }
+    }
+    // Composite one desktop's windows (live DWM thumbnails) into its card's picture rect.
+    // Whether a window is shown in a desktop's card: not minimized, and owned by that desktop.
+    bool BelongsTo(DesktopInfo desktop, StayView.Core.AppWindow w)
+    {
+        if (Native.IsIconic(w.Handle)) return false;
+        if (desktop.Id == Guid.Empty) return session.Desktops.IsCurrent(w.Handle);
+        // Realtek Audio Console was observed returning Guid.Empty at (40,32); treating that
+        // as "all desktops" produced Desktop 1's solid blue top-left blob. Unknown desktop
+        // ownership is omitted rather than composited into every real desktop card.
+        var id = session.Desktops.WindowDesktop(w.Handle);
+        return id != Guid.Empty && id == desktop.Id;
+    }
+    // prefiltered: `windows` already holds only this desktop's non-minimized windows (the
+    // per-frame zoom path), so the cross-process desktop lookup is skipped.
+    void ComposeDesktop(DesktopInfo desktop, Native.RECT picture, IReadOnlyList<StayView.Core.AppWindow> windows, Native.RECT screen, HashSet<nint> live, bool prefiltered = false)
+    {
             // Reverse EnumWindows' front-to-back order for correct composition.
             foreach (var w in windows.Reverse())
             {
-                if (Native.IsIconic(w.Handle)) continue;
-                var id = session.Desktops.WindowDesktop(w.Handle);
-                if (desktop.Id != Guid.Empty)
-                {
-                    // Realtek Audio Console was observed returning Guid.Empty at
-                    // (40,32); treating that as "all desktops" produced Desktop 1's
-                    // solid blue top-left blob. Unknown desktop ownership is now
-                    // omitted rather than composited into every real desktop card.
-                    if (id == Guid.Empty || id != desktop.Id) continue;
-                }
-                else if (!session.Desktops.IsCurrent(w.Handle)) continue;
+                if (!prefiltered && !BelongsTo(desktop, w)) continue;
                 if (!Native.GetWindowRect(w.Handle, out var source) || !source.Intersects(screen)) continue;
                 // Reuse this source's existing registration; only register once. Tearing
                 // every thumbnail down and rebuilding it each pass blinked all previews
@@ -527,11 +593,121 @@ sealed class OverlayChrome : Window
                     Source = crop, Visible = true, Opacity = 255, SourceClientOnly = false };
                 if (Native.DwmUpdateThumbnailProperties(thumb, ref props) == 0) live.Add(w.Handle);
             }
+    }
+
+    // Hover zoom for desktop cards: after a short dwell the card (and its live previews)
+    // eases out to a larger preview growing away from the bar; leaving it eases it back.
+    // Clicking while zoomed still switches (the card Border itself grows, so Tapped fires).
+    // Canvas tiles under the enlarged card are hidden (DWM would draw them over the XAML).
+    readonly FrameTimer cardZoomTimer = new();
+    readonly Dictionary<Guid,(Border Card,UIElement Label,double Left,double Top,double Width,double Height,DesktopInfo Desktop)> cardGeometry = [];
+    Guid cardZoomId, cardZoomPending;
+    Spring cardZoom;
+    double cardZoomTarget;
+    long cardZoomPendingSince, cardZoomLast;
+    Native.RECT? cardZoomPicture;
+    bool cardZoomOthersHidden;
+    IReadOnlyList<StayView.Core.AppWindow> cardZoomWindows = [];
+    const double CardZoomScale = 2.6, CardZoomDelayMs = 120;
+
+    void CardHover(Guid want)
+    {
+        if (want != Guid.Empty && want == cardZoomId) { cardZoomTarget = 1; cardZoomPending = Guid.Empty; }
+        else
+        {
+            if (cardZoomId != Guid.Empty) cardZoomTarget = 0;
+            if (want != cardZoomPending) { cardZoomPending = want; cardZoomPendingSince = Environment.TickCount64; }
         }
-        // Drop only the previews whose source is no longer shown (closed, minimized, moved
-        // to another desktop, or off-screen), leaving every reused registration in place.
-        foreach (var gone in desktopThumbBySource.Keys.Where(k => !live.Contains(k)).ToList())
-        { Native.DwmUnregisterThumbnail(desktopThumbBySource[gone]); desktopThumbBySource.Remove(gone); }
+        if ((cardZoomId != Guid.Empty || cardZoomPending != Guid.Empty) && !cardZoomTimer.IsEnabled) { cardZoomLast = Environment.TickCount64; cardZoomTimer.Start(); }
+    }
+    void CardZoomTick()
+    {
+        long now = Environment.TickCount64;
+        double dt = Math.Max(0, now - cardZoomLast); cardZoomLast = now;
+        if (cardZoomId != Guid.Empty)
+        {
+            if (!cardGeometry.TryGetValue(cardZoomId, out var g)) { StopCardZoom(); return; }
+            cardZoom.Step(cardZoomTarget, dt / 1000);
+            double e = Math.Clamp(cardZoom.Value, 0, 1);
+            var (zl, zt, zw, zh) = CardZoomRect(g.Left, g.Top, g.Width, g.Height);
+            double l = g.Left + (zl - g.Left) * e, t = g.Top + (zt - g.Top) * e, w = g.Width + (zw - g.Width) * e, h = g.Height + (zh - g.Height) * e;
+            Canvas.SetLeft(g.Card, l); Canvas.SetTop(g.Card, t); g.Card.Width = w; g.Card.Height = h;
+            g.Label.Opacity = 1 - e;
+            var cardScreen = new Native.RECT(work.Left + (int)Math.Round(l * scale), work.Top + (int)Math.Round(t * scale), (int)Math.Round(w * scale), (int)Math.Round(h * scale));
+            cardZoomPicture = new Native.RECT(cardScreen.Left + (int)(2 * scale), cardScreen.Top + (int)(2 * scale),
+                Math.Max(1, cardScreen.Width - (int)(4 * scale)), Math.Max(1, cardScreen.Height - (int)(4 * scale)));
+            // Thicker frame ring around the enlarged card, fading with the zoom; the tiles
+            // under card + ring are hidden (DWM would draw over the XAML).
+            PlaceCardRing(l, t, w, h, e);
+            int pad = (int)Math.Ceiling(CardRingInset * scale);
+            tilesView.SetCoverArea(e > .001 ? new Native.RECT(cardScreen.Left - pad, cardScreen.Top - pad, cardScreen.Width + 2 * pad, cardScreen.Height + 2 * pad) : null);
+            var screen = Native.MonitorBounds(Native.MonitorFromWindow(Handle, 2));
+            ComposeDesktop(g.Desktop, cardZoomPicture.Value, cardZoomWindows, screen, [], prefiltered: true);
+            // Neighbouring cards' live previews (DWM, drawn over all XAML) would paint over the
+            // enlarged card; hide them while it is out. EndCardZoom's recompose re-shows them.
+            if (e > .001 && !cardZoomOthersHidden)
+            {
+                cardZoomOthersHidden = true;
+                var own = cardZoomWindows.Select(w => w.Handle).ToHashSet();
+                foreach (var (source, thumb) in desktopThumbBySource)
+                    if (!own.Contains(source)) { var hide = new Native.THUMBNAIL { Flags = 8, Visible = false }; Native.DwmUpdateThumbnailProperties(thumb, ref hide); }
+            }
+            if (cardZoomTarget == 0 && cardZoom.Settled(0)) EndCardZoom();
+            else if (cardZoomTarget == 1 && cardZoom.Settled(1) && cardZoomPending == Guid.Empty) { cardZoom.Value = 1; cardZoom.Velocity = 0; cardZoomTimer.Stop(); }
+            return;
+        }
+        if (cardZoomPending == Guid.Empty) { cardZoomTimer.Stop(); return; }
+        if (now - cardZoomPendingSince < CardZoomDelayMs || !cardGeometry.ContainsKey(cardZoomPending)) return;
+        cardZoomId = cardZoomPending; cardZoomPending = Guid.Empty;
+        cardZoom.Reset(); cardZoomTarget = 1;
+        // Filter once (cross-process desktop lookups); frames then only recompute positions.
+        var zoomedDesktop = cardGeometry[cardZoomId].Desktop;
+        cardZoomWindows = session.DesktopWindows().Where(w => BelongsTo(zoomedDesktop, w)).ToList();
+        cardZoomOthersHidden = false;
+        Canvas.SetZIndex(cardGeometry[cardZoomId].Card, 200);
+    }
+    // Enlarged card: centred on the card, growing away from the bar, kept on the canvas.
+    (double Left, double Top, double Width, double Height) CardZoomRect(double left, double top, double width, double height)
+    {
+        double w = Math.Min(width * CardZoomScale, canvas.Width * .45), h = w * height / Math.Max(1, width);
+        double l = Math.Clamp(left + width / 2 - w / 2, 8, Math.Max(8, canvas.Width - 8 - w));
+        double t = settings.DesktopStripPosition == DesktopStripPosition.Bottom ? top + height - h : top;
+        return (l, Math.Max(0, t), w, h);
+    }
+    Border? cardRing;
+    const double CardRingGap = 3, CardRingThickness = 4, CardRingInset = CardRingGap + CardRingThickness;
+    void PlaceCardRing(double left, double top, double width, double height, double amount)
+    {
+        if (cardRing?.Parent == null)
+        {
+            cardRing = new Border { BorderThickness = new Thickness(CardRingThickness), CornerRadius = new CornerRadius(13),
+                BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(245, 30, 70, 150)),
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), IsHitTestVisible = false };
+            Canvas.SetZIndex(cardRing, 199);
+            canvas.Children.Add(cardRing);
+        }
+        cardRing.Width = width + 2 * CardRingInset; cardRing.Height = height + 2 * CardRingInset;
+        Canvas.SetLeft(cardRing, left - CardRingInset); Canvas.SetTop(cardRing, top - CardRingInset);
+        cardRing.Opacity = amount;
+        cardRing.Visibility = amount > .01 ? Visibility.Visible : Visibility.Collapsed;
+    }
+    void EndCardZoom()
+    {
+        if (cardRing != null) cardRing.Visibility = Visibility.Collapsed;
+        if (cardGeometry.TryGetValue(cardZoomId, out var g))
+        {
+            Canvas.SetLeft(g.Card, g.Left); Canvas.SetTop(g.Card, g.Top); g.Card.Width = g.Width; g.Card.Height = g.Height;
+            g.Label.Opacity = 1; Canvas.SetZIndex(g.Card, 0);
+        }
+        cardZoomId = Guid.Empty; cardZoom.Reset(); cardZoomPicture = null; cardZoomOthersHidden = false;
+        tilesView.SetCoverArea(null);
+        pictureSignature = "";           // recompose the card back at its normal size
+        UpdateDesktopPictures();
+    }
+    void StopCardZoom()
+    {
+        cardZoomTimer.Stop(); cardZoomPending = Guid.Empty;
+        if (cardZoomId != Guid.Empty) EndCardZoom();
     }
     void ClearDesktopThumbnails() { foreach (var t in desktopThumbBySource.Values) Native.DwmUnregisterThumbnail(t); desktopThumbBySource.Clear(); }
     public void ApplyAppearance() {
@@ -566,6 +742,6 @@ sealed class OverlayChrome : Window
     // Drop tiles whose source window has closed, so no clickable ghost is left behind.
     public void PruneDeadTiles() => tilesView.PruneDead();
     public void ApplyRegion() { } // No holes, ever.
-    public void Hide() { browsed.Clear(); tilesView.SetSuppressed(browsed); tilesView.Clear(); ClearDesktopThumbnails(); AppWindow.Hide(); }
+    public void Hide() { StopCardZoom(); browsed.Clear(); pinnedBrowsed.Clear(); tilesView.SetSuppressed(browsed); tilesView.Clear(); ClearDesktopThumbnails(); AppWindow.Hide(); }
     void Add(UIElement element, double x, double y) { Canvas.SetLeft(element, x); Canvas.SetTop(element, y); canvas.Children.Add(element); }
 }

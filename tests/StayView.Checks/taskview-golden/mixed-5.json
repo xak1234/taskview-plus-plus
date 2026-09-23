@@ -1,0 +1,126 @@
+{
+  "Scenario": "mixed-5",
+  "ScreenWidth": 3840,
+  "ScreenHeight": 2160,
+  "Work": {
+    "Width": 3840,
+    "Height": 2112,
+    "Left": 0,
+    "Top": 0,
+    "Right": 3840,
+    "Bottom": 2112
+  },
+  "Scale": 1,
+  "Windows": [
+    {
+      "Index": 0,
+      "Colour": "255,0,0",
+      "Source": {
+        "Width": 2380,
+        "Height": 1296,
+        "Left": 40,
+        "Top": 40,
+        "Right": 2420,
+        "Bottom": 1336
+      },
+      "Thumb": {
+        "Width": 872,
+        "Height": 475,
+        "Left": 1657,
+        "Top": 1016,
+        "Right": 2529,
+        "Bottom": 1491
+      },
+      "Pixels": 414162,
+      "HeaderTop": 977
+    },
+    {
+      "Index": 1,
+      "Colour": "0,255,0",
+      "Source": {
+        "Width": 806,
+        "Height": 1188,
+        "Left": 77,
+        "Top": 69,
+        "Right": 883,
+        "Bottom": 1257
+      },
+      "Thumb": {
+        "Width": 320,
+        "Height": 474,
+        "Left": 1311,
+        "Top": 1016,
+        "Right": 1631,
+        "Bottom": 1490
+      },
+      "Pixels": 151642,
+      "HeaderTop": 977
+    },
+    {
+      "Index": 2,
+      "Colour": "0,0,255",
+      "Source": {
+        "Width": 1612,
+        "Height": 907,
+        "Left": 114,
+        "Top": 98,
+        "Right": 1726,
+        "Bottom": 1005
+      },
+      "Thumb": {
+        "Width": 843,
+        "Height": 474,
+        "Left": 2010,
+        "Top": 476,
+        "Right": 2853,
+        "Bottom": 950
+      },
+      "Pixels": 399544,
+      "HeaderTop": 437
+    },
+    {
+      "Index": 3,
+      "Colour": "255,255,0",
+      "Source": {
+        "Width": 499,
+        "Height": 345,
+        "Left": 151,
+        "Top": 127,
+        "Right": 650,
+        "Bottom": 472
+      },
+      "Thumb": {
+        "Width": 497,
+        "Height": 344,
+        "Left": 1487,
+        "Top": 476,
+        "Right": 1984,
+        "Bottom": 820
+      },
+      "Pixels": 170930,
+      "HeaderTop": 437
+    },
+    {
+      "Index": 4,
+      "Colour": "255,0,255",
+      "Source": {
+        "Width": 1190,
+        "Height": 1188,
+        "Left": 188,
+        "Top": 156,
+        "Right": 1378,
+        "Bottom": 1344
+      },
+      "Thumb": {
+        "Width": 474,
+        "Height": 474,
+        "Left": 987,
+        "Top": 476,
+        "Right": 1461,
+        "Bottom": 950
+      },
+      "Pixels": 224638,
+      "HeaderTop": 437
+    }
+  ]
+}

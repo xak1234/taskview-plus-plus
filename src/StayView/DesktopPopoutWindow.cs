@@ -5,15 +5,17 @@ using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using StayView.Core;
+using System.Runtime.InteropServices;
 using Windows.Graphics;
 
 namespace StayView;
 
 // A right-clicked virtual desktop popped out as its own borderless, always-on-top
 // window: a live scaled copy (wallpaper + DWM thumbnails of that desktop's windows)
-// that can be dragged by its header, resized by the corner grip, and whose windows can
-// be clicked to jump to that desktop. The thumbnails are visual copies (not embedded
-// controls), so clicking one switches+focuses rather than interacting in place.
+// that can be dragged by its header and resized by the corner grip. Window thumbnails
+// can be dragged onto the current desktop. A click in this panel is not a focus
+// gesture: it must not browse, unbrowse, or move keyboard focus. The thumbnails are
+// visual copies, not the real windows.
 sealed class DesktopPopoutWindow : Window
 {
     readonly OverviewSession session;
@@ -25,6 +27,10 @@ sealed class DesktopPopoutWindow : Window
     readonly Button closeButton;
     readonly Border grip;
     readonly OverlappedPresenter presenter;
+    readonly Native.WndProc procedure;
+    readonly nint originalProc;
+    const uint RestoreFocusMessage = 0x8004;
+    nint focusRestore;
     // Keyed by source window so a refresh can reuse thumbnails instead of unregistering
     // and re-registering them all, which made the panel flicker whenever a window moved.
     readonly Dictionary<nint, nint> thumbBySource = [];
@@ -48,18 +54,21 @@ sealed class DesktopPopoutWindow : Window
     Native.POINT gestureStartCursor;
     RectInt32 gestureStartRect;
     bool bodyPressed, bodyMoved;
-    bool bodyWindowMoved,bodyMoveFailedLogged;
     nint bodyWindow;
     Native.RECT bodyWindowStart;
-    // A click on a window jumps to it, but only after the double-click interval, so a
-    // second click can instead put the desktop back in the bar.
-    readonly DispatcherTimer jumpTimer = new() { Interval = TimeSpan.FromMilliseconds(Native.GetDoubleClickTime()) };
-    nint pendingJump;
+    Native.RECT bodyWindowTarget;
+    Guid bodyStartDesktop;
+    // Empty-wallpaper double-click puts the desktop back in the bar. A click on a
+    // thumbnail does not, and it does not focus that window either.
     long lastBodyClick;
     Native.POINT lastBodyClickPoint;
     public event Action? Dismissed;
     public event Action<Guid>? UserCloseRequested;
-    public event Action<Guid, nint>? JumpToWindow;
+    public event Action<nint, Native.POINT>? WindowDragMoved;
+    public event Action? WindowDragEnded;
+    // A pointer press/release on the panel (header, grip or body). TrayApp re-asserts pins.
+    public event Action<bool>? PressChanged;
+    public Func<nint, Native.POINT, bool>? ExternalWindowDrop { get; set; }
     public bool IsInteracting => gestureMode != 0 || bodyPressed;
     public bool Suspended => suspended;
 
@@ -91,7 +100,14 @@ sealed class DesktopPopoutWindow : Window
         // Stay hidden until Present has sized, positioned and composed the panel,
         // otherwise a default-sized unpainted window flashes up first.
         AppWindow.Hide();
-        Native.SetWindowLongPtr(Handle, -20, (nint)(Native.GetWindowLongPtr(Handle, -20).ToInt64() | 0x80)); // WS_EX_TOOLWINDOW
+        // This is an interactive preview, not an application surface. Let it receive mouse
+        // input without ever becoming foreground: activating the popout makes the overview
+        // re-run its foreground/z-order maintenance and can blank DWM thumbnails for a frame.
+        // WS_EX_NOACTIVATE is the durable rule; WM_MOUSEACTIVATE below is a second guard for
+        // WinUI's island/native handoff while still allowing the click itself through.
+        Native.SetWindowLongPtr(Handle, -20, (nint)(Native.GetWindowLongPtr(Handle, -20).ToInt64() | 0x80 | 0x08000000)); // TOOLWINDOW|NOACTIVATE
+        procedure = WndProc;
+        originalProc = Native.SetWindowLongPtr(Handle, -4, Marshal.GetFunctionPointerForDelegate(procedure));
 
         var wp = desktop.Wallpaper;
         if (string.IsNullOrWhiteSpace(wp))
@@ -150,12 +166,43 @@ sealed class DesktopPopoutWindow : Window
         body.PointerMoved += BodyMoved;
         body.PointerReleased += BodyReleased;
         body.PointerCaptureLost += (_, _) => {
-            if (bodyPressed && bodyMoved && bodyWindow != 0&&bodyWindowMoved) session.NoteUserMoved(bodyWindow);
-            bodyPressed = false; bodyWindow = 0;
+            if(!bodyPressed)return;
+            // A cancelled drag only moved previews, so there is no placement to undo.
+            bodyPressed = false; bodyWindow = 0; contentSig="";
+            WindowDragEnded?.Invoke(); Refresh();
         };
-        jumpTimer.Tick += (_, _) => { jumpTimer.Stop(); var h = pendingJump; pendingJump = 0; if (h != 0) JumpToWindow?.Invoke(desktopId, h); };
         SizeChanged += (_, _) => Layout();
-        Closed += (_, _) => { jumpTimer.Stop(); pendingJump = 0; ClearDragPreview(); ClearThumbs(); Dismissed?.Invoke(); };
+        Closed += (_, _) => { WindowDragEnded?.Invoke(); ClearDragPreview(); ClearThumbs(); Dismissed?.Invoke(); };
+    }
+
+    nint WndProc(nint h,uint msg,nint wp,nint lp)
+    {
+        // MA_NOACTIVATE: deliver the mouse message to XAML (buttons, body drag, resize grip)
+        // but keep the existing foreground window untouched. WinUI can still activate this
+        // window or its owner after the callback. The posted pass puts that window back,
+        // so a popout click cannot focus or unfocus the window the user is working in.
+        if(msg==0x21)
+        {
+            var fg=Native.GetForegroundWindow();
+            if(fg!=0 && fg!=h) focusRestore=fg;
+            Native.PostMessage(h, RestoreFocusMessage, focusRestore, 0);
+            return 3; // WM_MOUSEACTIVATE / MA_NOACTIVATE
+        }
+        if(msg==RestoreFocusMessage)
+        {
+            var keep=wp;
+            if(keep!=0 && Native.IsWindow(keep))
+            {
+                var fg=Native.GetForegroundWindow();
+                if(fg!=keep)
+                {
+                    Native.GetWindowThreadProcessId(fg, out var pid);
+                    if(pid==(uint)Environment.ProcessId) Native.SetForegroundWindow(keep);
+                }
+            }
+            return 0;
+        }
+        return Native.CallWindowProc(originalProc,h,msg,wp,lp);
     }
 
     public void Present(Native.RECT work)
@@ -173,9 +220,9 @@ sealed class DesktopPopoutWindow : Window
         // Showing first (or before the move) flashes an unpainted default-sized window.
         Layout();
         frame.UpdateLayout();
-        AppWindow.Show();
+        AppWindow.Show(false);
         if (!pinned) pinned = session.Desktops.PinOwnWindow(Handle);
-        Activate();
+        BringToFront();
     }
 
     // When this panel's desktop becomes current, showing a miniature of that same desktop
@@ -186,8 +233,8 @@ sealed class DesktopPopoutWindow : Window
     {
         if (suspended) return;
         suspended = true;
-        jumpTimer.Stop(); pendingJump = 0;
         ClearDragPreview();
+        bodyPressed=false;bodyWindow=0;body.ReleasePointerCaptures();WindowDragEnded?.Invoke();
         AppWindow.Hide();
     }
 
@@ -204,10 +251,11 @@ sealed class DesktopPopoutWindow : Window
     void StartGesture(int mode, PointerRoutedEventArgs e, UIElement el)
     {
         if (!e.GetCurrentPoint(el).Properties.IsLeftButtonPressed) return;
-        jumpTimer.Stop(); pendingJump = 0; lastBodyClick = 0;
+        lastBodyClick = 0;
         Native.GetCursorPos(out gestureStartCursor);
         gestureStartRect = new RectInt32(AppWindow.Position.X, AppWindow.Position.Y, AppWindow.Size.Width, AppWindow.Size.Height);
         gestureMode = mode; gesturePointer = e.Pointer.PointerId; el.CapturePointer(e.Pointer); e.Handled = true;
+        PressChanged?.Invoke(true);
     }
     void GestureMove(object sender, PointerRoutedEventArgs e)
     {
@@ -229,14 +277,13 @@ sealed class DesktopPopoutWindow : Window
     }
     void EndGesture(UIElement el, PointerRoutedEventArgs e)
     {
-        if (gestureMode != 0 && e.Pointer.PointerId == gesturePointer) { gestureMode = 0; el.ReleasePointerCapture(e.Pointer); e.Handled = true; }
+        if (gestureMode != 0 && e.Pointer.PointerId == gesturePointer) { gestureMode = 0; el.ReleasePointerCapture(e.Pointer); e.Handled = true; PressChanged?.Invoke(false); }
     }
-    // Task-View style: a left-press anywhere on the panel body drags the whole panel.
-    // A press released without moving is a click, which jumps to that window instead.
+    // A left-press on empty wallpaper drags the panel. A press on a thumbnail drags
+    // that window's preview. A click that does not move does not change focus.
     void BodyPressed(object sender, PointerRoutedEventArgs e)
     {
         if (!e.GetCurrentPoint(body).Properties.IsLeftButtonPressed) return;
-        jumpTimer.Stop(); pendingJump = 0;
         Native.GetCursorPos(out gestureStartCursor);
         gestureStartRect = new RectInt32(AppWindow.Position.X, AppWindow.Position.Y, AppWindow.Size.Width, AppWindow.Size.Height);
         // A press on one of the live desktop thumbnails arms a move of that real
@@ -246,9 +293,14 @@ sealed class DesktopPopoutWindow : Window
         for (int i = windowRects.Count - 1; i >= 0; i--)
             if (Contains(windowRects[i].Rect, local)) { bodyWindow = windowRects[i].Handle; break; }
         if (bodyWindow != 0 && !Native.GetWindowRect(bodyWindow, out bodyWindowStart)) bodyWindow = 0;
+        if(bodyWindow!=0 && (Native.IsIconic(bodyWindow)||Native.IsZoomed(bodyWindow)))
+            bodyWindowStart=Native.Placement(bodyWindow).NormalPosition;
+        bodyWindowTarget=bodyWindowStart;
+        bodyStartDesktop=session.Desktops.Current;
         bodyPressed = true; bodyMoved = false; gesturePointer = e.Pointer.PointerId;
-        bodyWindowMoved=false;bodyMoveFailedLogged=false;
-        body.CapturePointer(e.Pointer); e.Handled = true;
+        if(!body.CapturePointer(e.Pointer)){bodyPressed=false;bodyWindow=0;return;}
+        e.Handled = true;
+        PressChanged?.Invoke(true);
     }
     void BodyMoved(object sender, PointerRoutedEventArgs e)
     {
@@ -256,82 +308,63 @@ sealed class DesktopPopoutWindow : Window
         Native.GetCursorPos(out var c);
         int dx = c.X - gestureStartCursor.X, dy = c.Y - gestureStartCursor.Y;
         if (!bodyMoved && Math.Max(Math.Abs(dx), Math.Abs(dy)) < 6) { e.Handled = true; return; }
+        // A pinned focused window is geometry-locked. A popout drag must not start a
+        // transfer; a click here also must not focus or unfocus that window.
+        if(bodyWindow!=0 && session.IsPinned(bodyWindow)){e.Handled=true;return;}
         bodyMoved = true;
         if (bodyWindow != 0)
         {
-            if(!bodyWindowMoved&&Native.IsZoomed(bodyWindow))
-            {
-                Native.ShowWindow(bodyWindow,9);
-                if(Native.GetWindowRect(bodyWindow,out var restored))
-                {
-                    bodyWindowStart=restored;
-                    gestureStartCursor=c;dx=0;dy=0;
-                }
-            }
-            // The popout is a scaled map of one physical monitor. Convert movement in
-            // panel pixels back into desktop pixels and move the real HWND without
-            // activating or re-ordering it. Its existing DWM registration is then moved
-            // directly, avoiding a full popout rebuild on every pointer sample.
+            // Move only the preview during capture. A foreign maximized HWND must never
+            // receive SW_RESTORE here: that activates it and switches desktops mid-drag.
             var screen = SourceScreen();
             var content = PopoutContentRect();
             int realDx = (int)Math.Round(dx * screen.Width / (double)Math.Max(1, content.Width));
             int realDy = (int)Math.Round(dy * screen.Height / (double)Math.Max(1, content.Height));
             int left = bodyWindowStart.Width >= screen.Width ? screen.Left : Math.Clamp(bodyWindowStart.Left + realDx, screen.Left, screen.Right - bodyWindowStart.Width);
             int top = bodyWindowStart.Height >= screen.Height ? screen.Top : Math.Clamp(bodyWindowStart.Top + realDy, screen.Top, screen.Bottom - bodyWindowStart.Height);
-            if(Native.SetWindowPos(bodyWindow, 0, left, top, 0, 0, 0x15 | 0x4000))
-            {
-                bodyWindowMoved=true;
-                var moved = new Native.RECT(left, top, bodyWindowStart.Width, bodyWindowStart.Height);
-                UpdateWindowVisual(bodyWindow, moved);
-                contentSig = "";
-            }
-            else if(!bodyMoveFailedLogged)
-            {
-                bodyMoveFailedLogged=true;
-                Log.Write("Popout window move failed for "+bodyWindow+": "+System.Runtime.InteropServices.Marshal.GetLastWin32Error());
-            }
+            bodyWindowTarget=new(left,top,bodyWindowStart.Width,bodyWindowStart.Height);
+            if(ContainsScreenPoint(c))UpdateWindowVisual(bodyWindow,bodyWindowTarget);
+            WindowDragMoved?.Invoke(bodyWindow,c);
+            contentSig="";
         }
         else AppWindow.Move(new PointInt32(gestureStartRect.X + dx, gestureStartRect.Y + dy));
         e.Handled = true;
     }
     void BodyReleased(object sender, PointerRoutedEventArgs e)
     {
-        if (!bodyPressed) return;
+        if (!bodyPressed || e.Pointer.PointerId!=gesturePointer) return;
         bodyPressed = false; body.ReleasePointerCapture(e.Pointer); e.Handled = true;
+        PressChanged?.Invoke(false);
         if (bodyMoved)
         {
-            if (bodyWindow != 0&&bodyWindowMoved) session.NoteUserMoved(bodyWindow);
-            bodyWindow = 0; lastBodyClick = 0; Refresh(); return;
+            Native.GetCursorPos(out var drop);
+            var source=bodyWindow;bodyWindow=0;lastBodyClick=0;
+            WindowDragEnded?.Invoke();
+            if(source!=0 && bodyStartDesktop!=Guid.Empty && session.Desktops.Current==bodyStartDesktop)
+            {
+                if(ContainsScreenPoint(drop))session.MoveToDesktop(source,desktopId,bodyWindowTarget);
+                else ExternalWindowDrop?.Invoke(source,drop);
+            }
+            contentSig="";Refresh(); return;
         } // a drag cannot complete a double-click
         var clickedWindow=bodyWindow;
         bodyWindow = 0;
+        // A thumbnail click is not the overview's focus gesture. Leave the focused
+        // window, the grid, and keyboard focus exactly as they were. Only empty
+        // wallpaper participates in the double-click that dismisses this panel.
+        if(clickedWindow!=0){lastBodyClick=0;return;}
         Native.GetCursorPos(out var c);
         long now = Environment.TickCount64;
         int tolX = Math.Max(2, Native.GetSystemMetrics(36) / 2), tolY = Math.Max(2, Native.GetSystemMetrics(37) / 2);
-        // Window clicks always jump to that window. Only empty wallpaper participates in
-        // the double-click gesture that returns/dismisses the desktop popout.
-        if(clickedWindow!=0)
-        {
-            lastBodyClick=0;jumpTimer.Stop();pendingJump=0;
-            JumpToWindow?.Invoke(desktopId,clickedWindow);
-            return;
-        }
-        // Second EMPTY click in the same spot: put this desktop back in the bar.
         if (lastBodyClick != 0 && now - lastBodyClick <= Native.GetDoubleClickTime()
             && Math.Abs(c.X - lastBodyClickPoint.X) <= tolX && Math.Abs(c.Y - lastBodyClickPoint.Y) <= tolY)
         {
-            lastBodyClick = 0; jumpTimer.Stop(); pendingJump = 0;
+            lastBodyClick = 0;
             UserCloseRequested?.Invoke(desktopId);
             Close();
             return;
         }
         lastBodyClick = now; lastBodyClickPoint = c;
-        // A click on a window jumps to it, but only once the double-click interval has
-        // passed, so that a second click closes the panel instead of jumping.
-        var p = new Native.POINT { X = c.X - AppWindow.Position.X, Y = c.Y - AppWindow.Position.Y };
-        for (int i = windowRects.Count - 1; i >= 0; i--)
-            if (Contains(windowRects[i].Rect, p))
-            { pendingJump = windowRects[i].Handle; jumpTimer.Stop(); jumpTimer.Start(); return; }
     }
 
     // Keep above the overview and pick up window changes; skips work while the user is
@@ -403,7 +436,6 @@ sealed class DesktopPopoutWindow : Window
         // cause Windows to send PointerCaptureLost, which used to stop panel dragging
         // after the refresh timer ticked during a held mouse button.
         if (gestureMode != 0 || bodyPressed) return;
-        BringToFront();
         var windows = Snapshot();
         var sig = Signature(windows);
         if (sig == contentSig) return;
@@ -435,6 +467,16 @@ sealed class DesktopPopoutWindow : Window
         var screen = SourceScreen();
         return DesktopWindows().Select(h => (Handle: h, Bounds: Native.GetWindowRect(h, out var r) ? r : default))
             .Where(w => w.Bounds.Width > 0 && w.Bounds.Height > 0 && w.Bounds.Intersects(screen)).ToList();
+    }
+    public Native.RECT DropBounds(nint source,Native.POINT point)
+    {
+        var content=PopoutContentRect();
+        content=new(content.Left+AppWindow.Position.X,content.Top+AppWindow.Position.Y,content.Width,content.Height);
+        var screen=SourceScreen();
+        var location=DesktopDropGeometry.MapPoint(point,content,screen);
+        Native.GetWindowRect(source,out var bounds);
+        if(Native.IsIconic(source)||Native.IsZoomed(source))bounds=Native.Placement(source).NormalPosition;
+        return DesktopDropGeometry.AtPoint(bounds,location,screen);
     }
     static string Signature(IEnumerable<(nint Handle, Native.RECT Bounds)> windows) =>
         string.Join("|", windows.Select(w => $"{w.Handle}:{w.Bounds.Left},{w.Bounds.Top},{w.Bounds.Width},{w.Bounds.Height}"));
