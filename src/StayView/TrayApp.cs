@@ -67,7 +67,10 @@ sealed class TrayApp
     // foreground) first, at most two. A third promotion demotes the oldest back under the
     // canvas so its tile reappears.
     readonly List<nint> browsed = new();
-    sealed record PinState(Guid HomeDesktop,Native.RECT Bounds,bool Maximized,bool SystemPinned,bool OwnsSystemPin);
+    // TileOnly: pinned from its tile (right-hold on a window that is not focused). The tile
+    // stays on the canvas, locked and marked; the real window is not brought in front until
+    // the user clicks the tile, which turns it into an ordinary (in-front) pin.
+    sealed record PinState(Guid HomeDesktop,Native.RECT Bounds,bool Maximized,bool SystemPinned,bool OwnsSystemPin,bool TileOnly=false);
     readonly Dictionary<nint,PinState> pinnedWindows = [];
     readonly Dictionary<Guid,Dictionary<nint,DesktopWindowState>> desktopStates = [];
     bool preserveWindowState;
@@ -137,9 +140,10 @@ sealed class TrayApp
         }
         return true;
     }
+    // Pins shown in front of the overview (tile-only pins stay tiles on the canvas).
     IReadOnlyList<nint> CurrentPinned()
     {
-        return pinnedWindows.Where(pair=>Native.IsWindow(pair.Key)&&Native.IsWindowVisible(pair.Key)&&!Native.IsIconic(pair.Key)&&!session.IsMinimizedDocked(pair.Key))
+        return pinnedWindows.Where(pair=>!pair.Value.TileOnly&&Native.IsWindow(pair.Key)&&Native.IsWindowVisible(pair.Key)&&!Native.IsIconic(pair.Key)&&!session.IsMinimizedDocked(pair.Key))
             .Select(pair=>pair.Key).ToList();
     }
     void PublishBrowsed()
@@ -169,20 +173,17 @@ sealed class TrayApp
         var desktop=desktops.WindowDesktop(h);if(desktop==Guid.Empty)desktop=desktops.Current;
         bool alreadySystemPinned=settings.NativeDesktopPin&&desktops.IsWindowPinned(h);
         bool systemPinned=settings.NativeDesktopPin&&(alreadySystemPinned||desktops.PinWindow(h));
-        pinnedWindows[h]=new(desktop,bounds,maximized,systemPinned,systemPinned&&!alreadySystemPinned);
+        pinnedWindows[h]=new(desktop,bounds,maximized,systemPinned,systemPinned&&!alreadySystemPinned,TileOnly:fromTile&&!minimized);
         Log.Write($"[pin] pinned {h} at {bounds.Left},{bounds.Top},{bounds.Width},{bounds.Height}; all-desktops={systemPinned}");
         if(minimized){PublishBrowsed();session.Reflow();}
         else if(fromTile)
         {
-            // Same presentation as RestorePinsForCurrentDesktop: pins sit in front of the
-            // canvas; the reconciler treats a pinned-only browse as a valid resting state.
-            // Keyboard focus follows the pointer-up of the hold, which otherwise leaves
-            // the overview as the foreground window so the pin cannot take text.
-            Promote(h);
-            if(!browsing){browsing=true;input.Browsing=true;}
-            foreach(var chrome in overlays.Values){chrome.DropTopmost();chrome.ReassertBrowseZOrder();}
-            GivePinnedKeyboardFocus(h);
-            Log.Write($"[pin] tile pin shown {h}");
+            // Pinned in place as a tile: marked and locked on the canvas, the real window is
+            // NOT brought in front or focused. Clicking the tile later turns it into an
+            // in-front pin (ShowTilePin).
+            PublishBrowsed();
+            session.Reflow();
+            Log.Write($"[pin] tile pinned in place {h}");
         }
         else
         {
@@ -190,12 +191,38 @@ sealed class TrayApp
             GivePinnedKeyboardFocus(h);
         }
     }
+    // Clicking a tile-only pin brings its real window in front as an ordinary pin.
+    void ShowTilePin(nint h)
+    {
+        if(!pinnedWindows.TryGetValue(h,out var pin)||!pin.TileOnly)return;
+        pinnedWindows[h]=pin with {TileOnly=false};
+        KeepPinClearOfBar(h);
+        Log.Write($"[pin] tile pin brought in front {h}");
+    }
+    // The real window of a tile pin appears at its real position; if that lies under the
+    // desktop bar it would seem to jump up into the bar. Nudge it (same size) into the
+    // canvas area first, so the pin is locked somewhere it is actually usable.
+    void KeepPinClearOfBar(nint h)
+    {
+        if(!Native.GetWindowRect(h,out var r)||Native.IsZoomed(h)||Native.IsIconic(h))return;
+        var monitor=Native.MonitorFromWindow(h,2);
+        var canvas=Tiler.OverviewArea(Native.WorkArea(monitor),8,Native.MonitorScale(monitor),settings.DesktopStripPosition);
+        if(r.Height>canvas.Height)return;
+        int top=settings.DesktopStripPosition==DesktopStripPosition.Bottom
+            ? Math.Min(r.Top,canvas.Bottom-r.Height)
+            : Math.Max(r.Top,canvas.Top);
+        if(top==r.Top)return;
+        Native.SetWindowPos(h,0,r.Left,top,r.Width,r.Height,0x14);
+        if(pinnedWindows.TryGetValue(h,out var pin))pinnedWindows[h]=pin with {Bounds=new Native.RECT(r.Left,top,r.Width,r.Height)};
+        Log.Write($"[pin] moved {h} clear of the desktop bar to {r.Left},{top}");
+    }
     // Z-order alone is not keyboard focus. A pinned window the user is working in has to
     // become the foreground window, or keystrokes stay in the overview (or the previously
     // focused app) and the pin looks interactive while refusing text.
     void GivePinnedKeyboardFocus(nint h)
     {
         if(!session.Active||!IsPinned(h)||!Native.IsWindow(h)||Native.IsIconic(h)||session.IsMinimizedDocked(h))return;
+        if(pinnedWindows[h].TileOnly)return;   // a tile pin stays a tile until clicked
         foreach(var chrome in overlays.Values)chrome.DropTopmost();
         if(!session.Activate(h))
             Log.Write($"[pin] keyboard focus was not taken by {h}; fg={Native.GetForegroundWindow()}");
@@ -287,24 +314,25 @@ sealed class TrayApp
             if((minimized||!pin.Maximized)&&Native.GetWindowRect(h,out var now)&&!now.Equals(pin.Bounds))
             {
                 // A few pixels is the window's own frame, not a user move. Remember it.
-                // A real jump is put back. Focus alone is not an exemption any more: apps
-                // such as Windscribe drag themselves from their own client area while
-                // focused, which slipped past the lock. Only wait while the left button is
-                // held (mid-drag), then snap back on release. Settled adjustments above
-                // never trigger SetWindowPos, so text entry is not disturbed.
+                // A real jump is put back at once - this runs on every LOCATIONCHANGE, so a
+                // pinned window does not follow a drag (native moves are also cancelled in
+                // MoveSizeChanged; apps that drag themselves from their client area, such as
+                // Windscribe, are corrected here). Settled adjustments above never trigger
+                // SetWindowPos, so text entry is not disturbed.
                 // Primary button: physical right when the user swapped buttons (SM_SWAPBUTTON).
                 bool mouseDown=(Native.GetAsyncKeyState(Native.GetSystemMetrics(23)!=0?0x02:0x01)&0x8000)!=0;
                 if(PinnedWindowPolicy.IsSettledAdjustment(now,pin.Bounds))
                     pinnedWindows[h]=pin with {Bounds=now};
-                else if(!(typing&&mouseDown))
+                else
                 {
-                    // An app that keeps re-positioning itself (tray panels re-anchor) would
-                    // fight the lock every tick and flash. After three snap-backs within 5 s
-                    // accept where the app puts itself.
+                    // An app that keeps re-positioning itself on its own (tray panels
+                    // re-anchor) would fight the lock and flash. After three snap-backs with
+                    // no button held (the user is not dragging) within 5 s, accept where the
+                    // app puts itself. A user drag never counts toward this.
                     long t=Environment.TickCount64;
                     var (count,since)=pinSnapBacks.GetValueOrDefault(h);
                     if(t-since>5000){count=0;since=t;}
-                    if(++count>=3)
+                    if(!mouseDown&&++count>=3)
                     {
                         pinSnapBacks.Remove(h);
                         pinnedWindows[h]=pin with {Bounds=now};
@@ -312,7 +340,7 @@ sealed class TrayApp
                         return;
                     }
                     pinSnapBacks[h]=(count,since);
-                    Log.Write($"[pin] restored {h} to {pin.Bounds.Left},{pin.Bounds.Top} after a move to {now.Left},{now.Top}");
+                    if(!mouseDown)Log.Write($"[pin] restored {h} to {pin.Bounds.Left},{pin.Bounds.Top} after a move to {now.Left},{now.Top}");
                     Native.SetWindowPos(h,0,pin.Bounds.Left,pin.Bounds.Top,pin.Bounds.Width,pin.Bounds.Height,0x4014); // +SWP_ASYNCWINDOWPOS
                 }
             }
@@ -562,7 +590,13 @@ sealed class TrayApp
             if(session.Active && !input.IsDragging && CanBrowse(h))session.NoteUserMoved(h);
         });
         catalog.MoveSizeChanged += (h,started) => queue.TryEnqueue(() => {
-            if(IsPinned(h)){RestorePinnedGeometry(h);foreach(var chrome in overlays.Values)chrome.RefreshBrowseGeometry();return;}
+            if(IsPinned(h))
+            {
+                // A pinned window does not move: end Windows' move/size loop the moment it
+                // starts (covers custom title bars the caption block cannot see).
+                if(started)Native.PostMessage(h,0x001F,0,0); // WM_CANCELMODE
+                RestorePinnedGeometry(h);foreach(var chrome in overlays.Values)chrome.RefreshBrowseGeometry();return;
+            }
             if(started)
             {
                 if(session.Active && browsed.Contains(h))
@@ -997,6 +1031,7 @@ sealed class TrayApp
     {
         Log.Write($"[browse] enter {h} pinned={IsPinned(h)} stable={IsCurrentDesktopStable(h)} active={session.Active}");
         if (!session.Active || h==0 || !Native.IsWindow(h) || (!IsPinned(h)&&!IsCurrentDesktopStable(h))) return;
+        ShowTilePin(h);   // clicking a tile-only pin brings it in front as an ordinary pin
         var activationDesktop=desktops.Current;
         int version=++activationVersion;
         activating=true;

@@ -11,3 +11,5 @@ artifacts/
 *.bak-*
 *.tmp
 SESSION-UPDATES.md
+.omc/
+.kiro/

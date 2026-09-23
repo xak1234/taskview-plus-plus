@@ -693,8 +693,12 @@ sealed class DockView : IDisposable
             }
             if(tilePins.TryGetValue(source,out var item))
             {
-                Canvas.SetLeft(dot,Math.Max(1,(item.VisualCell.Left-work.Left)/scale+5));
-                Canvas.SetTop(dot,Math.Max(1,(item.VisualCell.Top-work.Top)/scale+5));
+                // Just outside the tile's top-left corner, like a pinned real window: the
+                // tile is a DWM thumbnail drawn over all XAML, so a dot inside it was hidden
+                // (only a sliver showed at the rounded corner, looking like a stray dot).
+                const double dotSize=18,dotGap=4;
+                Canvas.SetLeft(dot,Math.Max(1,(item.VisualCell.Left-work.Left)/scale-dotSize-dotGap));
+                Canvas.SetTop(dot,Math.Max(1,(item.VisualCell.Top-work.Top)/scale-dotSize-dotGap));
                 dot.Visibility=Visibility.Visible;
             }
             else if(Native.IsWindowVisible(source)&&!Native.IsIconic(source)&&Native.TryGetVisualBounds(source,out var real)&&real.Intersects(work))
@@ -868,7 +872,9 @@ sealed class DockView : IDisposable
         var p=ScreenPoint(e);
         lastPoint=p;
         // Docked minis are click-to-undock only; they never start a drag.
-        if(dragPhase==DragPhase.Pressed && !pressedDocked && Math.Max(Math.Abs(p.X-pressed.X),Math.Abs(p.Y-pressed.Y))>=8)
+        // Pinned tiles are locked in place: they never start a drag (a still press+release
+        // is still a click that brings the pinned window forward).
+        if(dragPhase==DragPhase.Pressed && !pressedDocked && !session.IsPinned(dragSource) && Math.Max(Math.Abs(p.X-pressed.X),Math.Abs(p.Y-pressed.Y))>=8)
         {
             dragPhase=DragPhase.Dragging;
             ClearHover();
