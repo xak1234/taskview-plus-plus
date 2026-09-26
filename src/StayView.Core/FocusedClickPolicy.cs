@@ -47,9 +47,20 @@ public static class FocusedClickPolicy
         => hit == 2 || (hit == 1 && winHeld)
             || (hit == null && (winHeld || fallbackCaption));
 
+    // HTMINBUTTON and HTCLOSE. Maximize stays blocked on a pinned window.
+    public static bool IsSystemCaptionButton(int? hit) => hit is 8 or 20;
+
     // A pinned focused window keeps its exact geometry. App client clicks still pass
-    // through, as do the native Minimize and Close buttons; all other non-client actions
-    // that can move/resize/maximize the window are blocked while it is pinned.
-    public static bool PinBlocksNonClient(int? hit, bool fallbackCaption = false)
-        => hit == null ? fallbackCaption : hit > 1 && hit is not 8 and not 20;
+    // through, as do Minimize and Close. The corner X is also passed through when the
+    // window did not answer the hit test: that button sits in the caption band, and
+    // treating the whole band as the title bar left some windows unable to close.
+    // A stationary press blocked on a pin is replayed on release so custom-chrome editors
+    // still take a caret. The system menu (3, whose Maximize/Size items resize the window),
+    // maximize (9), the grow box (4) and the sizing borders (10-18) would change the pin's
+    // geometry, so they are never replayed.
+    public static bool PinReplaysClick(int? hit) => hit is not (3 or 4 or 9 or (>= 10 and <= 18));
+
+    public static bool PinBlocksNonClient(int? hit, bool fallbackCaption = false, bool closeButton = false)
+        => closeButton || IsSystemCaptionButton(hit) ? false
+            : hit == null ? fallbackCaption : hit > 1 && hit is not 8 and not 20;
 }

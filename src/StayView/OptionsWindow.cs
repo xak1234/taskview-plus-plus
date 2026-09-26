@@ -87,14 +87,16 @@ sealed class OptionsWindow : Window
         var layoutCard=Section(body,"Layout");
         Setting(layoutCard,"Auto-arrange","Keep windows in the Task View layout",
             Toggle(settings.AutoArrange,v=>{settings.AutoArrange=v;settings.Save();layoutChanged();}));
+        Setting(layoutCard,"Repel windows","Windows push each other aside while one is dragged",
+            Toggle(settings.RepelWindows,v=>{settings.RepelWindows=v;settings.Save();}));
         Setting(layoutCard,"Focused windows","How many windows can be brought forward at once",
-            Segmented(new[]{"1","2","3","4","5"},Math.Clamp(settings.MaxBrowsedWindows,1,5)-1,i=>{settings.MaxBrowsedWindows=i+1;settings.Save();layoutChanged();}));
+            Segmented(new[]{"1","2","3","4","5"},Math.Clamp(settings.MaxBrowsedWindows,1,5)-1,i=>{settings.MaxBrowsedWindows=i+1;settings.Save();layoutChanged();},true),stacked:true);
 
         // DOCK
         var dock=Section(body,"Dock");
         Setting(dock,"Dock minimized windows","Minimized windows sit in the desktop bar",
             Toggle(settings.DockMinimizedWindows,v=>{settings.DockMinimizedWindows=v;settings.Save();layoutChanged();}));
-        Setting(dock,"Dock on bar contact","Pushing a window into the bar docks it",
+        Setting(dock,"Dock on bar contact","Holding a window against the bar for a second docks it",
             Toggle(settings.DockOnBarContact,v=>{settings.DockOnBarContact=v;settings.Save();}));
         Setting(dock,"Plasma effect","Electric arcs when a window meets the bar",
             Toggle(settings.PlasmaEffect,v=>{settings.PlasmaEffect=v;settings.Save();}));
@@ -109,7 +111,16 @@ sealed class OptionsWindow : Window
         Setting(desktops,"Desktop transition","Animation when switching desktops",
             Segmented(new[]{"Slide","Appear","Shift right","Shift left","Implode","Explode"},Math.Max(0,Array.IndexOf(transitionModes,settings.DesktopTransition)),i=>{settings.DesktopTransition=transitionModes[i];settings.Save();},true),stacked:true);
 
+        // SESSION
+        var sessionCard=Section(body,"Session");
+        Setting(sessionCard,"Restore apps after sign-in","Reopen the apps that were open, on their desktops and in place",
+            Toggle(settings.RestoreAppsAfterSignIn,v=>{settings.RestoreAppsAfterSignIn=v;settings.Save();}));
+        Setting(sessionCard,"Start with Windows","Start Taskview++ when you sign in",
+            Toggle(settings.StartWithWindows,v=>{settings.StartWithWindows=v;settings.Save();StartupRegistration.Apply(v,Environment.ProcessPath!);}));
+
         body.Children.Add(Footer());
+        body.Children.Add(new TextBlock{Text="franks.apps",FontFamily=Text,FontSize=10,Foreground=GlassAppearance.SecondaryBrush(),
+            HorizontalAlignment=HorizontalAlignment.Center,Margin=new Thickness(0,10,0,0)});
 
         ApplyAppearance();
         FitToContent(header,body,scroller,windowScale,work);
@@ -180,7 +191,7 @@ sealed class OptionsWindow : Window
     static StackPanel Section(StackPanel body,string title)
     {
         body.Children.Add(new TextBlock{Text=title,FontFamily=Text,FontSize=14,FontWeight=Microsoft.UI.Text.FontWeights.SemiBold,
-            Foreground=GlassAppearance.PrimaryBrush(),HorizontalAlignment=HorizontalAlignment.Center,Margin=new Thickness(0,12,0,4)});
+            Foreground=GlassAppearance.PrimaryBrush(),HorizontalAlignment=HorizontalAlignment.Center,Margin=new Thickness(0,18,0,8)});
         var rows=new StackPanel();
         body.Children.Add(new Border{Child=rows,CornerRadius=new CornerRadius(8),BorderThickness=new Thickness(1),
             BorderBrush=GlassAppearance.EdgeBrush(),Background=GlassAppearance.SurfaceBrush(CardOpacity)});
@@ -193,18 +204,18 @@ sealed class OptionsWindow : Window
     {
         if(rows.Children.Count>0)
             rows.Children.Add(new Border{Height=1,Background=GlassAppearance.EdgeBrush(),Opacity=.6,Margin=new Thickness(16,0,16,0)});
-        var labels=new StackPanel{Spacing=1,VerticalAlignment=VerticalAlignment.Center};
+        var labels=new StackPanel{Spacing=2,VerticalAlignment=VerticalAlignment.Center};
         labels.Children.Add(new TextBlock{Text=name,FontFamily=Text,FontSize=14,Foreground=GlassAppearance.PrimaryBrush()});
-        labels.Children.Add(new TextBlock{Text=description,FontFamily=Text,FontSize=12,Foreground=GlassAppearance.SecondaryBrush(),TextWrapping=TextWrapping.Wrap});
+        labels.Children.Add(new TextBlock{Text=description,FontFamily=Text,FontSize=12,Foreground=GlassAppearance.SecondaryBrush(),TextWrapping=TextWrapping.WrapWholeWords});
         if(stacked)
         {
-            var column=new StackPanel{Spacing=10,Padding=new Thickness(16,12,16,14)};
+            var column=new StackPanel{Spacing=10,Padding=new Thickness(16,14,16,14)};
             column.Children.Add(labels);
             column.Children.Add(control);
             rows.Children.Add(column);
             return;
         }
-        var grid=new Grid{ColumnSpacing=16,Padding=new Thickness(16,11,12,11),MinHeight=60};
+        var grid=new Grid{ColumnSpacing=16,Padding=new Thickness(16,12,16,12),MinHeight=64};
         grid.ColumnDefinitions.Add(new ColumnDefinition{Width=new GridLength(1,GridUnitType.Star)});
         grid.ColumnDefinitions.Add(new ColumnDefinition{Width=GridLength.Auto});
         grid.Children.Add(labels);
@@ -216,7 +227,8 @@ sealed class OptionsWindow : Window
     // Native Windows toggle, compact (no On/Off caption beside it).
     static ToggleSwitch Toggle(bool value,Action<bool> changed)
     {
-        var toggle=new ToggleSwitch{IsOn=value,OnContent=null,OffContent=null,MinWidth=0,Margin=new Thickness(0,0,-8,0)};
+        var toggle=new ToggleSwitch{IsOn=value,OnContent=null,OffContent=null,MinWidth=0,
+            HorizontalAlignment=HorizontalAlignment.Right,VerticalAlignment=VerticalAlignment.Center,Margin=new Thickness(0)};
         toggle.Toggled+=(_,_)=>changed(toggle.IsOn);
         return toggle;
     }
@@ -240,7 +252,7 @@ sealed class OptionsWindow : Window
         for(int i=0;i<labels.Length;i++)
         {
             int index=i;
-            var b=new Button{Content=labels[i],Height=30,MinWidth=stretch?0:44,Padding=new Thickness(12,0,12,0),FontSize=12.5,FontFamily=Text,
+            var b=new Button{Content=labels[i],Height=32,MinWidth=stretch?0:44,Padding=new Thickness(stretch?6:12,0,stretch?6:12,0),FontSize=12,FontFamily=Text,
                 HorizontalAlignment=HorizontalAlignment.Stretch,HorizontalContentAlignment=HorizontalAlignment.Center,
                 CornerRadius=new CornerRadius(5),BorderThickness=new Thickness(0)};
             b.Click+=(_,_)=>{selected=index;Paint();changed(index);};

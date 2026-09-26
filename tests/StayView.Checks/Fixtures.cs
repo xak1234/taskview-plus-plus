@@ -154,19 +154,20 @@ static class Fixtures
             if(!wasSystemPinned&&!desktops.UnpinWindow(window))throw new Exception("Could not release the disposable Windows view pin");
             Console.WriteLine("PASS: Windows view pin engages for a normal disposable window.");
 
-            // Exercise the same fallback TrayApp uses when native view pinning is absent.
-            // Moving desktop ownership is deliberately tested only while unpinned because
-            // Windows clears a native view pin when MoveViewToDesktop is called.
+            // A pin that was carried onto another desktop is sent back to the desktop
+            // where it was pinned. Moving is tested only while unpinned because Windows
+            // clears a native view pin when MoveViewToDesktop is called.
             if(!wasSystemPinned)
             {
-                if(!desktops.Move(window,foreign.Id))throw new Exception("Could not move the fallback-pin fixture away from the current desktop");
+                if(!desktops.Move(window,foreign.Id))throw new Exception("Could not move the pin fixture away from its home desktop");
                 await Task.Delay(100);
                 var owner=desktops.WindowDesktop(window);
-                if(!PinnedWindowPolicy.NeedsDesktopMove(false,current,owner))throw new Exception("Fallback pin policy did not request a move to the active desktop");
-                if(!desktops.Move(window,current))throw new Exception("Could not follow the active desktop with the fallback-pin fixture");
+                if(!PinnedWindowPolicy.NeedsHomeReturn(false,current,owner))throw new Exception("A pin left on another desktop was not sent home");
+                if(PinnedWindowPolicy.NeedsHomeReturn(false,current,current))throw new Exception("A pin already on its home desktop was moved");
+                if(!desktops.Move(window,current))throw new Exception("Could not return the pin fixture to its home desktop");
                 await Task.Delay(100);Native.GetWindowRect(window,out actual);
-                if(desktops.WindowDesktop(window)!=current||!actual.Equals(original))throw new Exception("Fallback pin follow lost desktop ownership or geometry");
-                Console.WriteLine("PASS: fallback pinning follows the active desktop without changing window geometry.");
+                if(desktops.WindowDesktop(window)!=current||!actual.Equals(original))throw new Exception("Returning a pin home lost desktop ownership or geometry");
+                Console.WriteLine("PASS: a pin carried onto another desktop is sent back home without changing window geometry.");
             }
             Native.ShowWindow(window,7);
             await Task.Delay(100);

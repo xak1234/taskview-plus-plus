@@ -35,7 +35,12 @@ public sealed class InputHooks : IDisposable
     public Func<Native.POINT,nint>? OverviewPinTarget;
     // The window a left-drag may move (the one currently browsed).
     public Func<nint>? BrowsedWindow;
+    // Builds, once per drag, the clamp that keeps the dragged window off the desktop bar.
+    public Func<nint,Func<Native.RECT,Native.RECT>?>? StripClampFor;
+    Func<Native.RECT,Native.RECT>? dragClamp;
     public event Action<nint>? WindowDragged;
+    // A focused-window drag passed the threshold (fires once per drag, on the hook thread).
+    public event Action<nint>? WindowDragStarted;
     public bool IsDragging => dragArmed;
     static readonly nuint DragSentinel = 0x53565744; // "SVWD": marks our own replayed click
     const int DragThreshold = 6;
@@ -94,9 +99,23 @@ public sealed class InputHooks : IDisposable
             // A stationary press never became a move. Replay it so the app can place a
             // caret. Custom-chrome editors report that area as non-client; swallowing
             // the click outright left those windows unable to take text after a pin.
-            bool replay=pinnedClickPending && !pinnedClickMoved;
+            // Never replay onto maximize or a sizing border (a pin keeps its geometry), and
+            // never replay the second click of a caption double-click, which would maximize
+            // or restore the pin.
+            bool replay=pinnedClickPending && !pinnedClickMoved && FocusedClickPolicy.PinReplaysClick(pinnedClickHit);
             pinnedClickPending=false; pinnedClickMoved=false;
-            if(replay) ReplayClick(false);
+            if(replay)
+            {
+                long now=Environment.TickCount64;
+                int tolX=Math.Max(2,Native.GetSystemMetrics(36)/2),tolY=Math.Max(2,Native.GetSystemMetrics(37)/2);
+                // Compared with the last REPLAYED click, which is what Windows sees: a swallowed
+                // click must not reset it, or click 3 of a triple-click pairs with click 1.
+                bool secondClick=(pinnedClickHit is null or 2) && lastPinnedReplay!=0 && now-lastPinnedReplay<=Native.GetDoubleClickTime()
+                    && Math.Abs(mouse.Point.X-lastPinnedReplayPoint.X)<=tolX && Math.Abs(mouse.Point.Y-lastPinnedReplayPoint.Y)<=tolY;
+                if(secondClick)return 1;
+                lastPinnedReplay=now;lastPinnedReplayPoint=mouse.Point;
+                ReplayClick(false);
+            }
             return 1;
         }
         if(msg==0x205 && swallowRightRelease){swallowRightRelease=false;return 1;}
@@ -134,9 +153,18 @@ public sealed class InputHooks : IDisposable
                     if (Native.GetWindowRect(dragTarget, out var restored))
                     { dragOrigin = new Native.RECT(mp.X - restored.Width / 2, mp.Y - 20, restored.Width, restored.Height); dragStart = mp; }
                 }
+                // Frame margins are measured once here; each move below only does the
+                // monitor lookup inside the clamp.
+                dragClamp = StripClampFor?.Invoke(dragTarget);
+                WindowDragStarted?.Invoke(dragTarget);
             }
             int dx = mp.X - dragStart.X, dy = mp.Y - dragStart.Y;
             int wantX = dragOrigin.Left + dx, wantY = dragOrigin.Top + dy;
+            if (dragClamp != null)
+            {
+                var allowed = dragClamp(new Native.RECT(wantX, wantY, dragOrigin.Width, dragOrigin.Height));
+                wantX = allowed.Left; wantY = allowed.Top;
+            }
             // Move only: never resize, re-order or activate.
             bool ok = Native.SetWindowPos(dragTarget, 0, wantX, wantY, 0, 0, 0x15 | 0x4000);
             // Only a failure is worth a line, once per drag (err 5 = the target is
@@ -155,7 +183,10 @@ public sealed class InputHooks : IDisposable
         if(msg==0x204) // WM_RBUTTONDOWN
         {
             GestureVersion++;lastDown=0;pendingClient=0;
-            if(!TryArmRightGesture(mouse.Point))
+            // The hook is installed for the app's whole life. Right-hold pin and right-drag
+            // are overview gestures only: with the overview closed every right press belongs
+            // to the application under the pointer.
+            if(!active || IsActive?.Invoke()!=true || !TryArmRightGesture(mouse.Point))
                 return Native.CallNextHookEx(mouseHook,code,wp,lp);
             // Suppress the app's right-down while the gesture is undecided. If the pointer
             // never moves past the drag threshold, replay a normal right click on release.
@@ -165,13 +196,13 @@ public sealed class InputHooks : IDisposable
         {
             if(!dragArmed||dragButton!=2)
                 return Native.CallNextHookEx(mouseHook,code,wp,lp);
-            bool toggled=rightHoldTriggered,moved=rightHoldMoved;
+            bool toggled=rightHoldTriggered,moved=rightHoldMoved,dragAllowed=rightDragAllowed;
             CancelRightHold();
             rightHoldTriggered=false;rightHoldMoved=false;rightDragAllowed=false;
             dragArmed=false;dragButton=0;
             if(toggled)return 1;
             if(dragging){dragging=false;WindowDragged?.Invoke(dragTarget);return 1;}
-            if(moved){if(!rightDragAllowed)ReplayClick(true);return 1;}
+            if(moved){if(!dragAllowed)ReplayClick(true);return 1;}
             ReplayClick(true);
             return 1;
         }
@@ -230,12 +261,18 @@ public sealed class InputHooks : IDisposable
     bool swallowPinnedLeftRelease;
     bool pinnedClickPending, pinnedClickMoved;
     Native.POINT pinnedClickStart;
+    int? pinnedClickHit;
+    long lastPinnedReplay;
+    Native.POINT lastPinnedReplayPoint;
     bool TryBlockPinnedNonClient(Native.POINT p)
     {
+        pinnedClickHit=null;
         var target=Native.GetAncestor(Native.WindowFromPoint(p),2);
         if(target==0 || IsPinnedWindow?.Invoke(target)!=true || !Native.GetWindowRect(target,out var r))return false;
         var hit=HitTest(target,p,r);
-        return FocusedClickPolicy.PinBlocksNonClient(hit,hit==null&&InFallbackCaption(p,r));
+        pinnedClickHit=hit;
+        bool closeButton=FocusedClickPolicy.IsSystemCaptionButton(hit)||InCloseButton(p,r);
+        return FocusedClickPolicy.PinBlocksNonClient(hit,hit==null&&InFallbackCaption(p,r)&&!closeButton,closeButton);
     }
     // Arm a move of the window under the cursor, if the press landed on its title bar.
     // It must be a real top-level window of another process (never our own overlay or a
@@ -271,6 +308,9 @@ public sealed class InputHooks : IDisposable
         // can contain tabs, buttons or editable text. Win+drag is the explicit override.
         bool winHeld = winKeyDown || Native.GetAsyncKeyState(0x5B) < 0 || Native.GetAsyncKeyState(0x5C) < 0;
         var hit = HitTest(target, p, r);
+        // Minimize and the corner X belong to the application. Claiming them as a
+        // title-bar gesture is why some windows never closed.
+        if (FocusedClickPolicy.IsSystemCaptionButton(hit) || InCloseButton(p, r)) return false;
         bool fallbackCaption = hit == null && InFallbackCaption(p, r);
         isClient = hit == 1;
         canShrink = FocusedClickPolicy.CanShrink(hit, fallbackCaption);
@@ -388,6 +428,16 @@ public sealed class InputHooks : IDisposable
             || p.Y - r.Top < border || r.Bottom - p.Y <= border;
         return !edge && p.Y - r.Top < border + caption;
     }
+    // The corner X is the rightmost caption button. A timed-out hit test used to call
+    // this whole band the title bar, so the click never reached the application.
+    static bool InCloseButton(Native.POINT p, Native.RECT r)
+    {
+        int border = Math.Max(4, Native.GetSystemMetrics(32) + Native.GetSystemMetrics(92));
+        int caption = Math.Max(1, Native.GetSystemMetrics(4));
+        int button = Math.Max(46, Native.GetSystemMetrics(30));
+        return p.X >= r.Right - border - button && p.X < r.Right
+            && p.Y >= r.Top && p.Y < r.Top + border + caption;
+    }
     static bool PointInsideWindow(nint h, Native.POINT p)
     {
         if (h == 0 || !Native.IsWindow(h) || !Native.GetWindowRect(h, out var r)) return false;
@@ -409,7 +459,17 @@ public sealed class InputHooks : IDisposable
         // Windows can reserve this chord. The keyboard hook handles that exact
         // chord when RegisterHotKey fails; never silently substitute another one.
     }
-    public void SetOverview(bool value) => active = value;
+    public void SetOverview(bool value)
+    {
+        active = value;
+        if (value || !dragArmed || dragButton != 2) return;
+        // The overview closed mid right-hold/drag: end the gesture so nothing is pinned or
+        // moved afterwards, and swallow the release whose press was already swallowed.
+        CancelRightHold();
+        swallowRightRelease = true;
+        rightHoldTriggered = false; rightHoldMoved = false; rightDragAllowed = false;
+        dragArmed = false; dragging = false; dragButton = 0;
+    }
     nint Keyboard(int code, nint wp, nint lp)
     {
         if (code < 0) return Native.CallNextHookEx(hook, code, wp, lp);

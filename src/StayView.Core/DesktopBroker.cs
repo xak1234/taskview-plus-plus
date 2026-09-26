@@ -54,6 +54,7 @@ sealed class DesktopConnection : IDisposable
         try{
             string name="StayView.Desktops."+Guid.NewGuid().ToString("N");
             process=Process.Start(new ProcessStartInfo(Environment.ProcessPath!,"--desktop-broker "+name){UseShellExecute=false,CreateNoWindow=true});
+            ChildProcessJob.Helpers.Track(process); // dies with the UI process, however it ends
             pipe=new NamedPipeClientStream(".",name,PipeDirection.InOut,PipeOptions.Asynchronous);
             pipe.Connect(1500);reader=new(pipe);writer=new(pipe){AutoFlush=true};Ready=true;
             Ready=Call<bool>(new("available"));
@@ -106,8 +107,32 @@ public sealed class VirtualDesktopService
     static readonly object connectionGate=new();
     static DesktopConnection? connection;
     static long retryAfter;
-    readonly IVirtualDesktopManager? standard;
-    public VirtualDesktopService(){try{standard=(IVirtualDesktopManager)Activator.CreateInstance(Type.GetTypeFromCLSID(new("AA509086-5CA9-4C25-8F95-589D3C07B48A"))!)!;}catch{}}
+    IVirtualDesktopManager? standard;
+    long standardRetryAfter;
+    public VirtualDesktopService(){standard=CreateStandard();}
+    static IVirtualDesktopManager? CreateStandard()
+    {
+        try{return (IVirtualDesktopManager)Activator.CreateInstance(Type.GetTypeFromCLSID(new("AA509086-5CA9-4C25-8F95-589D3C07B48A"))!)!;}
+        catch{return null;}
+    }
+    // A COM failure (Explorer restarted) leaves the old instance dead: drop it and create a
+    // fresh one on a later call, at most once a second, instead of failing for good.
+    IVirtualDesktopManager? Standard()
+    {
+        if(standard==null && Environment.TickCount64>=standardRetryAfter)
+        {
+            standardRetryAfter=Environment.TickCount64+1000;
+            standard=CreateStandard();
+        }
+        return standard;
+    }
+    // Only a dead connection to the shell drops the instance; per-window errors (a window
+    // the shell does not track) are normal answers and keep it.
+    void StandardFailed(COMException ex)
+    {
+        if((uint)ex.HResult is 0x80010108 or 0x800706BA or 0x80010007 or 0x80010012 or 0x800401FD or 0x800706BE)
+            standard=null;
+    }
     static DesktopConnection? Connection()
     {
         if(Environment.OSVersion.Version.Build is <26100 or >26200)return null;
@@ -137,8 +162,8 @@ public sealed class VirtualDesktopService
     public bool Available=>Connection()!=null;
     public string Status=>Available?"Windows virtual desktops":"Desktop controls unavailable on this Windows build; current-desktop tiling remains available.";
     public Guid Current=>BrokerCall<Guid>(new("current"));
-    public bool IsCurrent(nint h){try{return standard?.IsWindowOnCurrentVirtualDesktop(h)??true;}catch{return true;}}
-    public Guid WindowDesktop(nint h){try{return standard?.GetWindowDesktopId(h)??Guid.Empty;}catch{return Guid.Empty;}}
+    public bool IsCurrent(nint h){try{return Standard()?.IsWindowOnCurrentVirtualDesktop(h)??true;}catch(COMException ex){StandardFailed(ex);return true;}catch{return true;}}
+    public Guid WindowDesktop(nint h){try{return Standard()?.GetWindowDesktopId(h)??Guid.Empty;}catch(COMException ex){StandardFailed(ex);return Guid.Empty;}catch{return Guid.Empty;}}
     public IReadOnlyList<DesktopInfo> List()=>BrokerCall<List<DesktopInfo>>(new("list"))??[];
     public bool PinWindow(nint h)=>BrokerCall<bool>(new("pin",Handle:h.ToInt64()));
     public bool IsWindowPinned(nint h)=>BrokerCall<bool>(new("isPinned",Handle:h.ToInt64()));
@@ -149,6 +174,6 @@ public sealed class VirtualDesktopService
     public bool Remove(Guid id)=>BrokerCall<bool>(new("remove",id));
     public bool MoveDesktop(Guid id,int index)=>BrokerCall<bool>(new("moveDesktop",id,Index:index));
     public bool Move(nint h,Guid id)=>BrokerCall<bool>(new("move",id,h.ToInt64()));
-    public void MoveOwnWindow(nint h,Guid id){try{if(id!=Guid.Empty)standard?.MoveWindowToDesktop(h,ref id);}catch(Exception ex){Log.Write(ex.Message);}}
+    public void MoveOwnWindow(nint h,Guid id){try{if(id!=Guid.Empty)Standard()?.MoveWindowToDesktop(h,ref id);}catch(Exception ex){if(ex is COMException com)StandardFailed(com);Log.Write(ex.Message);}}
     public static void ShutdownBroker(){lock(connectionGate){try{connection?.Dispose();}catch(Exception ex){Log.Write("Desktop broker shutdown: "+ex.Message);}connection=null;retryAfter=long.MaxValue;}}
 }

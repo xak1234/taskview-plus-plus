@@ -33,6 +33,7 @@ public sealed class EmptySpaceProbe : IDisposable
         {
             string name = "StayView.EmptySpace." + Guid.NewGuid().ToString("N");
             process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--empty-space-probe " + name) { UseShellExecute = false, CreateNoWindow = true });
+            ChildProcessJob.Helpers.Track(process); // dies with the UI process, however it ends
             pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
             pipe.Connect(1500);
             reader = new(pipe); writer = new(pipe) { AutoFlush = true };

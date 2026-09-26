@@ -27,6 +27,9 @@ public static class Native
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(nint h);
     [DllImport("user32.dll")] public static extern bool IsIconic(nint h);
     [DllImport("user32.dll")] public static extern bool IsZoomed(nint h);
+    [DllImport("user32.dll",EntryPoint="IsWindowArranged")] static extern bool IsWindowArrangedNative(nint h);
+    // Snapped (Win+Arrow, Snap Layouts). Missing on older builds: treat as not arranged.
+    public static bool IsWindowArranged(nint h){try{return IsWindowArrangedNative(h);}catch(EntryPointNotFoundException){return false;}}
     [DllImport("user32.dll")] public static extern nint GetWindow(nint h,uint cmd);
     [DllImport("user32.dll")] public static extern nint GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
@@ -114,6 +117,17 @@ public static class Native
             return true; // DWMWA_EXTENDED_FRAME_BOUNDS
         return GetWindowRect(h,out r) && r.Width>0 && r.Height>0;
     }
+    // A minimized window's own frame: the off-screen sentinel, or a shrunken bar that is
+    // not the application's normal rectangle. Drawing or saving that rect shows the
+    // window's minimized border instead of the window.
+    public static bool IsMinimizedChrome(RECT visual, RECT normal)
+    {
+        if(visual.Width<=0||visual.Height<=0)return true;
+        if(visual.Left<=-30000||visual.Top<=-30000||visual.Right<=-30000||visual.Bottom<=-30000)return true;
+        if(normal.Width<80||normal.Height<60)return false;
+        if(visual.Height<=40&&normal.Height>=visual.Height*3)return true;
+        return (long)visual.Width*visual.Height*6<(long)normal.Width*normal.Height;
+    }
     // True when `upper` is currently above `lower` in the top-level HWND z-order.
     // Walking from lower toward the top avoids changing activation merely to verify the
     // browse invariant (real source above opaque overview). Cap the walk defensively in
@@ -125,6 +139,27 @@ public static class Native
         for(int i=0;h!=0&&i<4096;i++,h=GetWindow(h,3))
             if(h==upper)return true;
         return false;
+    }
+    // A second DWM thumbnail, hosted in a window that is pinned to every desktop,
+    // makes Windows paint the source window's own frame on the current desktop.
+    // These attributes suppress that frame for as long as the preview holds the window.
+    public static void SuppressThumbnailGhostFrame(nint h)
+    {
+        uint zero = 0, one = 1, none = 0xFFFFFFFEu;
+        DwmSetWindowAttribute(h, 2, ref one, sizeof(uint));   // DWMNCRP_DISABLED
+        DwmSetWindowAttribute(h, 7, ref zero, sizeof(uint));  // DWMWA_FORCE_ICONIC_REPRESENTATION
+        DwmSetWindowAttribute(h, 10, ref zero, sizeof(uint)); // DWMWA_HAS_ICONIC_BITMAP
+        DwmSetWindowAttribute(h, 11, ref one, sizeof(uint));  // DWMWA_DISALLOW_PEEK
+        DwmSetWindowAttribute(h, 12, ref one, sizeof(uint));  // DWMWA_EXCLUDED_FROM_PEEK
+        DwmSetWindowAttribute(h, 34, ref none, sizeof(uint)); // DWMWA_BORDER_COLOR = none
+    }
+    public static void RestoreThumbnailGhostFrame(nint h)
+    {
+        uint zero = 0, normal = 0xFFFFFFFFu;
+        DwmSetWindowAttribute(h, 2, ref zero, sizeof(uint));    // DWMNCRP_USEWINDOWSTYLE
+        DwmSetWindowAttribute(h, 11, ref zero, sizeof(uint));
+        DwmSetWindowAttribute(h, 12, ref zero, sizeof(uint));
+        DwmSetWindowAttribute(h, 34, ref normal, sizeof(uint)); // DWMWA_COLOR_DEFAULT
     }
     public static void DisableDwmBorder(nint h) {
         // DWMWA_BORDER_COLOR + DWMWA_COLOR_NONE removes Windows 11's thin native

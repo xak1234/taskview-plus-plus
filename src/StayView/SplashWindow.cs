@@ -6,8 +6,8 @@ using StayView.Core;
 
 namespace StayView;
 
-// Launch splash: "Taskview++" centred on the primary monitor while the app loads, then a
-// window-level alpha fade (layered window) so the panel and its background fade together.
+// Launch splash: "Taskview++" centred on the primary monitor. The whole panel fades in,
+// the title holds, then the panel fades out. Window-level alpha so the background fades too.
 sealed class SplashWindow : Window
 {
     [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(nint h, uint key, byte alpha, uint flags);
@@ -16,10 +16,10 @@ sealed class SplashWindow : Window
     const long WS_EX_LAYERED = 0x80000, WS_EX_TOOLWINDOW = 0x80, WS_EX_TRANSPARENT = 0x20;
 
     readonly nint handle;
-    readonly long shownAt = Environment.TickCount64;
     readonly FrameTimer fadeTimer = new();
-    const int MinimumVisibleMs = 900, FadeMs = 600;
-    long fadeStart;
+    const int FadeInMs = 500, HoldMs = 1400, FadeOutMs = 650;
+    long shownAt, fadeOutAt;
+    bool fadeOutRequested;
     Action? faded;
 
     public SplashWindow()
@@ -38,7 +38,8 @@ sealed class SplashWindow : Window
         // Layered for the alpha fade, tool window (no taskbar button), click-through.
         long ex = Native.GetWindowLongPtr(handle, GWL_EXSTYLE).ToInt64();
         Native.SetWindowLongPtr(handle, GWL_EXSTYLE, (nint)(ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT));
-        SetLayeredWindowAttributes(handle, 0, 255, LWA_ALPHA);
+        SetLayeredWindowAttributes(handle, 0, 0, LWA_ALPHA);
+        Activated += (_, _) => Begin();
 
         var title = new TextBlock
         {
@@ -93,41 +94,62 @@ sealed class SplashWindow : Window
         fadeTimer.Tick += (_, _) => FadeTick();
     }
 
+    void Begin()
+    {
+        if (shownAt == 0) shownAt = Environment.TickCount64;
+        if (!fadeTimer.IsEnabled) fadeTimer.Start();
+    }
+
+    void SetAlpha(double opacity)
+        => SetLayeredWindowAttributes(handle, 0, (byte)Math.Round(255 * Math.Clamp(opacity, 0, 1)), LWA_ALPHA);
+
     // Show without taking keyboard focus (used when closing the overview with Esc, so the
     // window the user returns to keeps focus), then fade.
     public void ShowPassiveAndFade()
     {
         AppWindow.Show(false);
+        Begin();
         FadeOut();
     }
 
     // Keep above the overview that opens underneath while loading.
     public void KeepOnTop() => Native.SetWindowPos(handle, -1, 0, 0, 0, 0, 0x13 | 0x10); // TOPMOST, NOMOVE|NOSIZE|NOACTIVATE
 
-    // Fade once the minimum display time has passed, then close.
-    // onFaded runs once the banner has faded and closed (used to quit after the exit banner).
+    // Fade out after the title has faded in and held. onFaded runs once the banner
+    // has faded and closed (used to quit after the exit banner).
     public void FadeOut(Action? onFaded = null)
     {
         faded = onFaded ?? faded;
+        fadeOutRequested = true;
+        Begin();
         KeepOnTop();
-        if (!fadeTimer.IsEnabled) fadeTimer.Start();
     }
 
     void FadeTick()
     {
         long now = Environment.TickCount64;
-        if (now - shownAt < MinimumVisibleMs) { KeepOnTop(); return; }
-        if (fadeStart == 0) fadeStart = now;
+        if (shownAt == 0) shownAt = now;
+        long elapsed = now - shownAt;
         KeepOnTop();   // the overview underneath re-asserts topmost while it settles
-        double t = Math.Clamp((now - fadeStart) / (double)FadeMs, 0, 1);
-        double eased = 1 - (1 - t) * (1 - t);
-        SetLayeredWindowAttributes(handle, 0, (byte)Math.Round(255 * (1 - eased)), LWA_ALPHA);
-        if (t >= 1)
+        if (elapsed < FadeInMs)
         {
-            fadeTimer.Stop();
-            try { Close(); }
-            catch (Exception ex) { Log.Write("Splash close: " + ex.Message); }
-            finally { var done = faded; faded = null; done?.Invoke(); }
+            double t = elapsed / (double)FadeInMs;
+            SetAlpha(t * t * (3 - 2 * t));
+            return;
         }
+        if (!fadeOutRequested || now < shownAt + FadeInMs + HoldMs)
+        {
+            SetAlpha(1);
+            return;
+        }
+        if (fadeOutAt == 0) fadeOutAt = now;
+        double outT = Math.Clamp((now - fadeOutAt) / (double)FadeOutMs, 0, 1);
+        double eased = outT * outT * (3 - 2 * outT);
+        SetAlpha(1 - eased);
+        if (outT < 1) return;
+        fadeTimer.Stop();
+        try { Close(); }
+        catch (Exception ex) { Log.Write("Splash close: " + ex.Message); }
+        finally { var done = faded; faded = null; done?.Invoke(); }
     }
 }

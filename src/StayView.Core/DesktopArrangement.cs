@@ -7,6 +7,7 @@ public readonly record struct DesktopWindowState(
     bool Docked,
     bool MinimizedDocked,
     bool Focused,
+    int FocusOrder,
     Native.RECT Tile,
     bool HasTile,
     int Z);
@@ -16,6 +17,17 @@ public readonly record struct DesktopWindowState(
 public static class DesktopArrangement
 {
     public static bool Include(bool pinned) => !pinned;
+
+    // The show command used to put a window back when its desktop is re-entered while the
+    // overview is up, or null to leave it alone. A window remembered as minimized is never
+    // minimized for real here: the overview keeps minimized sources restored behind the
+    // canvas so their dock/tile thumbnails stay live, so minimizing it only played the
+    // minimize animation over the switch, then the restore animation, and eventually got
+    // the window flagged as minimizing itself. Iconic ones are left for the keep-alive;
+    // shown ones are only repositioned.
+    public static int? RecallShowCmd(int rememberedShowCmd, bool iconicNow)
+        => rememberedShowCmd is 2 or 6 or 7 ? (iconicNow ? null : 4)
+            : rememberedShowCmd == 3 ? 3 : 4;
 
     public static void MembershipEdits(
         IEnumerable<KeyValuePair<nint, DesktopWindowState>> saved,

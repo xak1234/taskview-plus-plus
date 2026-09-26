@@ -48,6 +48,24 @@ public sealed class OverviewSession : IDisposable
     public Func<nint,bool>? IsPinnedWindow { get; set; }
     public Func<nint,bool>? KeepMinimized { get; set; }
     public bool IsPinned(nint h) => IsPinnedWindow?.Invoke(h) == true;
+    // Monitor -> screen rectangle of the desktop bar shown on it (empty when none).
+    public Func<nint,Native.RECT>? StripBarFor { get; set; }
+    public Native.RECT StripBar(nint monitor) => StripBarFor?.Invoke(monitor) ?? default;
+    // A clamp for moving window h (USER32 rectangle in, same-sized rectangle out) that keeps
+    // its visible frame off whichever monitor's desktop bar it is over. The frame margins are
+    // measured once here, so a drag builds this at its start and calls it per pointer move.
+    // Null when the overview is closed or the window's geometry is unknown.
+    public Func<Native.RECT,Native.RECT>? StripClamp(nint h)
+    {
+        if(!Active || h==0 || !Native.GetWindowRect(h,out var current) || !Native.TryGetVisualBounds(h,out var visual))return null;
+        int leftMargin=visual.Left-current.Left,topMargin=visual.Top-current.Top,width=visual.Width,height=visual.Height;
+        return rect=>{
+            var probe=new Native.RECT(rect.Left+leftMargin,rect.Top+topMargin,width,height);
+            var monitor=Native.MonitorFromRect(ref probe,2);
+            return monitor==0?rect:FocusedWindowGeometry.MoveOffBar(rect,leftMargin,topMargin,width,height,StripBar(monitor),Native.WorkArea(monitor));
+        };
+    }
+    public Native.RECT KeepOffStrip(nint h, Native.RECT windowRect) => StripClamp(h)?.Invoke(windowRect) ?? windowRect;
     public bool IsMinimizedDocked(nint h) => minimizedDocked.Contains(h);
     public int DesktopTransitionVersion { get; private set; }
     public int DesktopTransitionDirection { get; private set; } = 1;
@@ -188,9 +206,6 @@ public sealed class OverviewSession : IDisposable
         // they lose focus. Restoring them every tick flashes their tile forever, so a window
         // that re-minimizes three times within a few seconds is left minimized this session.
         if (selfMinimizing.Contains(h)) return;
-        // A desktop remembers minimized status. Do not quietly restore those windows
-        // just so a thumbnail can update; coming back must still find them minimized.
-        if (KeepMinimized?.Invoke(h) == true) return;
         // A global dock thumbnail is not permission to activate a foreign desktop.
         // Unknown ownership also waits until the shell can positively identify it.
         var current=Desktops.Current;
@@ -250,13 +265,10 @@ public sealed class OverviewSession : IDisposable
         if(h == 0 || draggingTile == h) draggingTile = 0;
     }
     // Docking is canvas state only: the source HWND is never moved or minimised.
+    // A pin is never docked, whatever asks: drag, minimize, or the dock-minimized setting.
     public bool DockTile(nint h)
     {
-        return DockTileCore(h,false);
-    }
-    bool DockTileCore(nint h,bool allowPinned)
-    {
-        if(!Active||h==0||draggingTile!=0||!Native.IsWindow(h)||(!allowPinned&&IsPinned(h)))return false;
+        if(!Active||h==0||draggingTile!=0||!Native.IsWindow(h)||!PinnedWindowPolicy.CanDock(IsPinned(h)))return false;
         // Manual layout: pin every current cell (this tile's too) so docking/undocking
         // never repacks untouched tiles and an undocked tile returns to its old spot.
         if(!settings.AutoArrange)foreach(var pair in currentCells)positions.TryAdd(pair.Key,pair.Value);
@@ -317,10 +329,10 @@ public sealed class OverviewSession : IDisposable
     // at `rect` (Task View spacing, TileRepulsion). Nothing is committed.
     public IReadOnlyDictionary<nint,Native.RECT> PreviewDrag(nint h,Native.RECT rect)
     {
-        if(!Active||h==0)return new Dictionary<nint,Native.RECT>();
+        if(!Active||h==0){LastYielded=rect;return new Dictionary<nint,Native.RECT>();}
         var probe=rect;
         var monitor=Native.MonitorFromRect(ref probe,2);
-        if(monitor==0)return new Dictionary<nint,Native.RECT>();
+        if(monitor==0){LastYielded=rect;return new Dictionary<nint,Native.RECT>();}
         double dpi=Native.MonitorScale(monitor);
         var canvas=Tiler.OverviewArea(Native.WorkArea(monitor),8,dpi,settings.DesktopStripPosition);
         var home=new Dictionary<nint,Native.RECT>();
@@ -332,11 +344,21 @@ public sealed class OverviewSession : IDisposable
         }
         var pinned=home.Keys.Where(IsPinned).ToHashSet();
         var (hGap,vGap,header)=TaskViewLayout.MinimumSpacing(dpi);
+        // A pin does not move, and the dragged window cannot pass through it.
+        var yielded=TileRepulsion.YieldToFixed(rect,pinned.Select(id=>home[id]),canvas,hGap,vGap,header);
+        LastYielded=yielded;
         // The previous frame keeps each pushed neighbour escaping to the same side.
         // The dragged tile's own cell is still its pre-drag home (committed only on drop).
         Native.RECT? vacated=currentCells.TryGetValue(h,out var from)?from:null;
-        lastPreview=TileRepulsion.Resolve(h,rect,home,pinned,canvas,hGap,vGap,header,lastPreview,vacated);
+        lastPreview=TileRepulsion.Resolve(h,yielded,home,pinned,canvas,hGap,vGap,header,lastPreview,vacated);
         return lastPreview;
+    }
+    // Where the dragged window actually sits after pinned windows have pushed it aside.
+    public Native.RECT LastYielded { get; private set; }
+    public Native.RECT ClearOfPins(nint dragged, Native.RECT desired)
+    {
+        PreviewDrag(dragged, desired);
+        return LastYielded.Width>0?LastYielded:desired;
     }
     Dictionary<nint,Native.RECT>? lastPreview;
     public void DropTile(nint h,Native.RECT rect,Native.RECT original)
@@ -348,7 +370,7 @@ public sealed class OverviewSession : IDisposable
         // nearest free spot); if the canvas has no room at all the whole drop snaps back.
         List<KeyValuePair<nint,Native.RECT>>? pushed=null;
         bool settledElsewhere=false;
-        if(!settings.AutoArrange&&Active)
+        if(!settings.AutoArrange&&settings.RepelWindows&&Active)
         {
             var preview=PreviewDrag(h,rect);
             var probe=rect;var monitor=Native.MonitorFromRect(ref probe,2);
@@ -392,6 +414,20 @@ public sealed class OverviewSession : IDisposable
         // Any neighbour moved automatically by Auto Arrange keeps its existing HWND spot.
         if((dx!=0||dy!=0)&&Placements.Translate(h,dx,dy))tileMoved.Add(h);
     }
+    // Keep the slots neighbours slid into while another window was dragged.
+    // Pinned windows are not in this set: the repel solve leaves them at home.
+    public void CommitNeighbourRepel(nint dragged, Native.RECT draggedRect)
+    {
+        if(!Active||settings.AutoArrange||!settings.RepelWindows)return;
+        foreach(var (source,cell) in PreviewDrag(dragged,draggedRect))
+        {
+            if(source==dragged||IsPinned(source))continue;
+            if(!currentCells.TryGetValue(source,out var home)||home.Equals(cell))continue;
+            positions[source]=cell;
+            currentCells[source]=cell;
+        }
+        lastPreview=null;
+    }
     // Docks (or releases) the windows that were already minimized when this session
     // opened, to match the current setting. Canvas state only, like every other dock
     // action: the source HWND is never moved or minimised by it. Callers reflow.
@@ -400,7 +436,7 @@ public sealed class OverviewSession : IDisposable
         foreach (var h in minimizedOnEntry.ToList())
         {
             if (!Native.IsWindow(h)) { minimizedOnEntry.Remove(h); continue; }
-            if (settings.DockMinimizedWindows) { if (!docked.Contains(h)) docked.Add(h); }
+            if (settings.DockMinimizedWindows && PinnedWindowPolicy.CanDock(IsPinned(h))) { if (!docked.Contains(h)) docked.Add(h); }
             else docked.Remove(h);
         }
     }
@@ -504,7 +540,7 @@ public sealed class OverviewSession : IDisposable
         // eventual StayView dismissal does not minimize it again behind the user's back.
         if(userIsRestoring || (tileMoved.Contains(h) && !Native.IsZoomed(h)))
         {
-            Placements.Recapture(h);
+            RecaptureUserPlacement(h);
             tileMoved.Remove(h);
             minimizedOnEntry.Remove(h);
             docked.Remove(h);
@@ -514,9 +550,17 @@ public sealed class OverviewSession : IDisposable
         Selected = h;
         return true;
     }
-    public void Close(nint h) { if (Active) Native.PostMessage(h, 0x10, 0, 0); }
+    public void Close(nint h)
+    {
+        if (!Active || h == 0 || !Native.IsWindow(h)) return;
+        var root = Native.GetAncestor(h, 2);
+        if (root != 0) h = root;
+        // The corner X sends WM_SYSCOMMAND/SC_CLOSE. A bare WM_CLOSE is ignored by
+        // some custom frames, which then look like the button did nothing.
+        Native.PostMessage(h, 0x0112, (nint)0xF060, 0);
+    }
     // The user dragged a real window while browsing; keep that placement on dismissal.
-    public void NoteUserMoved(nint h) { if (Active) { Placements.Recapture(h); tileMoved.Remove(h); } }
+    public void NoteUserMoved(nint h) { if (Active) { Placements.Recapture(h); tileMoved.Remove(h); presentationOffset.Remove(h); presentedAt.Remove(h); } }
     // Apply a miniature-drag placement while the overview is still covering the source.
     // This is called before focus animation (and again by Activate for minimized sources
     // that finish restoring between retries), so a plain focus click never relocates a
@@ -530,6 +574,68 @@ public sealed class OverviewSession : IDisposable
         // endpoint is the exact visible frame that will take over.
         if(!PlacementStore.ApplyPendingGeometry(h,saved))
             Log.Write($"Tile placement move failed for {h}: {System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
+        // The window now sits exactly at the user's tile-drag placement: any earlier
+        // presentation offset no longer applies (subtracting it would journal a spot the
+        // user never chose).
+        else { presentationOffset.Remove(h); presentedAt.Remove(h); }
+    }
+    // Focusing a tile expands the window over that tile: move the real window (position
+    // only) so its visible frame is centred on the tile, inside the work area. This is an
+    // overview-only presentation, so it is NOT journaled: dismissal puts the window back
+    // where it was, unless the user moves it themselves (NoteUserMoved recaptures).
+    public bool CenterOverTile(nint h)
+    {
+        // A tile the user dragged already carries their chosen placement for this window
+        // (PrepareActivationGeometry applies it, and Activate applies it again): centring
+        // would expand to one spot and then jump to the other.
+        if(!Active || h==0 || tileMoved.Contains(h) || !Native.IsWindow(h) || Native.IsIconic(h) || Native.IsZoomed(h) || IsPinned(h)
+            || !currentCells.TryGetValue(h,out var cell)
+            || !Native.GetWindowRect(h,out var window) || !Native.TryGetVisualBounds(h,out var visual))return false;
+        var monitor=Native.MonitorFromWindow(h,2);
+        if(monitor==0)return false;
+        var target=FocusedWindowGeometry.CenterOver(window,visual,cell,Native.WorkArea(monitor));
+        return MovePresented(h,target.Left,target.Top);
+    }
+    // How far StayView has moved each window purely for the overview (centre over tile,
+    // off the desktop bar, clear of a pin). Every automatic journal update takes this back
+    // out, so only placement the user chose is restored on dismissal. A move the user
+    // makes themselves (NoteUserMoved) is journaled as-is and resets the offset.
+    readonly Dictionary<nint,(int X,int Y)> presentationOffset=[];
+    public bool MovePresented(nint h,int left,int top)
+    {
+        if(!Active || h==0 || !Native.GetWindowRect(h,out var current))return false;
+        int dx=left-current.Left,dy=top-current.Top;
+        if(dx==0&&dy==0)return false;
+        if(!Native.SetWindowPos(h,0,left,top,0,0,0x15))return false; // NOSIZE|NOZORDER|NOACTIVATE
+        var offset=presentationOffset.GetValueOrDefault(h);
+        presentationOffset[h]=(offset.X+dx,offset.Y+dy);
+        presentedAt[h]=new Native.RECT(left,top,current.Width,current.Height);
+        return true;
+    }
+    // Journal the window's current state minus StayView's presentation moves.
+    void RecaptureUserPlacement(nint h)
+    {
+        var offset=presentationOffset.GetValueOrDefault(h);
+        Placements.Recapture(h,offset.X,offset.Y);
+    }
+    // After a native move/resize by the user: journal where they put it, then slide the
+    // frame off the desktop bar as presentation only.
+    public void NoteUserMovedOffStrip(nint h)
+    {
+        if(!Active || h==0)return;
+        NoteUserMoved(h);
+        // A drag that ended maximized (dragged to the top edge) is left to Windows.
+        if(Native.IsZoomed(h) || !Native.GetWindowRect(h,out var moved))return;
+        var clear=KeepOffStrip(h,moved);
+        MovePresented(h,clear.Left,clear.Top);
+    }
+    // Where the focus animation of a visible frame ends: inside the work area, off the bar.
+    // Must match what EnsureActivationTopVisible does to the real window.
+    public Native.RECT FocusTarget(nint monitor, Native.RECT visual)
+    {
+        var work=Native.WorkArea(monitor);
+        var fitted=FocusedWindowGeometry.FitInside(visual,work);
+        return FocusedWindowGeometry.MoveOffBar(fitted,0,0,fitted.Width,fitted.Height,StripBar(monitor),work);
     }
     public bool EnsureActivationTopVisible(nint h)
     {
@@ -540,40 +646,65 @@ public sealed class OverviewSession : IDisposable
         // MonitorFromRect would then legitimize the bad position by switching work areas.
         var monitor=Native.MonitorFromWindow(h,2); // MONITOR_DEFAULTTONEAREST
         if(monitor==0)return false;
-        var corrected=FocusedWindowGeometry.ClampVisibleTop(windowBounds,visualBounds,Native.WorkArea(monitor));
-        if(corrected.Equals(windowBounds))return false;
-        if(!Native.SetWindowPos(h,0,corrected.Left,corrected.Top,0,0,0x15))return false; // NOZORDER|NOSIZE|NOACTIVATE
-        Placements.UpdateGeometry(h);
-        return true;
+        var work=Native.WorkArea(monitor);
+        bool changed=false;
+        // A frame outside the work area is a real placement fault: fix it and journal it.
+        var corrected=FocusedWindowGeometry.FitWindowInside(windowBounds,visualBounds,work);
+        if(!corrected.Equals(windowBounds))
+        {
+            if(!Native.SetWindowPos(h,0,corrected.Left,corrected.Top,corrected.Width,corrected.Height,0x14))return false; // NOZORDER|NOACTIVATE
+            var offset=presentationOffset.GetValueOrDefault(h);
+            Placements.UpdateGeometry(h,offset.X,offset.Y);
+            changed=true;
+        }
+        // The desktop bar only exists while the overview is up. Slide the frame off it
+        // without resizing, as presentation only, so dismissal restores the user's spot.
+        var visible=FocusedWindowGeometry.FitInside(visualBounds,work);
+        int leftMargin=visualBounds.Left-windowBounds.Left,topMargin=visualBounds.Top-windowBounds.Top;
+        var clear=FocusedWindowGeometry.MoveOffBar(corrected,leftMargin,topMargin,visible.Width,visible.Height,StripBar(monitor),work);
+        if(MovePresented(h,clear.Left,clear.Top))changed=true;
+        return changed;
     }
     // Focused native Minimize means "dock" while StayView is active. Establish the dock
     // cell before the shrink animation starts, then reserve the source until Windows has
     // completed its own minimize transition. The source is restored behind the overview at
     // completion so the dock remains live; the journal deliberately stays non-minimized.
-    public void BeginUserMinimize(nint h)
+    public bool BeginUserMinimize(nint h)
     {
-        if(!Active || h==0 || !Native.IsWindow(h))return;
+        if(!Active || h==0 || !Native.IsWindow(h) || !PinnedWindowPolicy.CanDock(IsPinned(h)))return false;
         userMinimized.Add(h);
         minimizedDocked.Add(h);
-        DockTileCore(h,true);
+        return docked.Contains(h) || DockTile(h);
     }
+    // The window was restored before StayView finished docking it (EVENT_SYSTEM_MINIMIZEEND
+    // is the RESTORE event). Only an unfinished minimize is cancelled: a window StayView
+    // already docked and restored behind the canvas keeps its minimized-docked state.
     public void CancelUserMinimize(nint h)
     {
-        if(!Active || Native.IsIconic(h))return;
-        userMinimized.Remove(h);
+        if(!Active || Native.IsIconic(h) || !userMinimized.Remove(h))return;
         minimizedDocked.Remove(h);
     }
     public void NoteUserMinimized(nint h)
     {
-        if(!Active || !Native.IsIconic(h))return;
-        minimizedDocked.Add(h);
-        if(!docked.Contains(h))DockTileCore(h,true);
-        userMinimized.Remove(h);
-        RestoreMinimizedSourceForOverview(h);
+        if(!Active || !Native.IsIconic(h) || !PinnedWindowPolicy.CanDock(IsPinned(h)))return;
+        userMinimized.Add(h);
+        FinishUserMinimize(h);
     }
-    // EVENT_SYSTEM_MINIMIZEEND is advisory rather than a transaction boundary: on some
-    // windows it can arrive late (or not at all). If the normal grid maintenance path sees
-    // the HWND become iconic first, finish the same minimize-to-dock conversion there.
+    // Dock a window the user minimized, then restore it behind the canvas so its dock
+    // thumbnail is live. A refused dock (a tile drag in progress) leaves it minimized and
+    // in userMinimized, so the next grid-maintenance pass tries again.
+    bool FinishUserMinimize(nint h)
+    {
+        // Out of the set before DockTile: DockTile reflows, and a reflow runs this confirm
+        // pass again, which must not re-enter for the same window.
+        userMinimized.Remove(h);
+        if(!docked.Contains(h) && !DockTile(h)){ userMinimized.Add(h); return false; }
+        minimizedDocked.Add(h);
+        RestoreMinimizedSourceForOverview(h);
+        return true;
+    }
+    // The minimize itself has no reliable completion event, so grid maintenance finishes
+    // the minimize-to-dock conversion once it sees the HWND iconic.
     public void ConfirmUserMinimizedSources()
     {
         if(!Active)return;
@@ -581,10 +712,7 @@ public sealed class OverviewSession : IDisposable
         {
             if(!Native.IsWindow(h)){userMinimized.Remove(h);continue;}
             if(!Native.IsIconic(h))continue;
-            minimizedDocked.Add(h);
-            if(!docked.Contains(h))DockTile(h);
-            userMinimized.Remove(h);
-            RestoreMinimizedSourceForOverview(h);
+            FinishUserMinimize(h);
         }
     }
     // A user RESIZE of the focused window is theirs to keep (edge/corner drag, maximize,
@@ -617,8 +745,19 @@ public sealed class OverviewSession : IDisposable
         if (!immediate && (!settling.TryGetValue(h, out var previous) || !Same(now, previous)))
         { settling[h] = now; return; }
         settling.Remove(h);
-        Placements.Recapture(h);
+        // Maximized: only NormalPosition is journaled, and that is still the presented spot,
+        // so the offset comes out. A snap (Win+Arrow, Snap Layouts) or any window no longer
+        // where StayView put it was placed by someone else: journal that exact rectangle.
+        // Only a plain resize of a still-presented window keeps the offset out.
+        if(!Native.IsZoomed(h) && (Native.IsWindowArranged(h) || !IsStillPresented(h,now)))
+        { Placements.Recapture(h); presentationOffset.Remove(h); presentedAt.Remove(h); }
+        else RecaptureUserPlacement(h);
     }
+    // The last rectangle MovePresented produced, per window. A window no longer at the
+    // spot StayView put it was moved by someone else, so its offset is stale.
+    readonly Dictionary<nint,Native.RECT> presentedAt=[];
+    bool IsStillPresented(nint h,Native.RECT now)
+        => presentationOffset.ContainsKey(h) && presentedAt.TryGetValue(h,out var at) && at.Left==now.Left && at.Top==now.Top;
     static bool Same(Native.RECT a, Native.RECT b) => a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom;
     public bool MoveToDesktop(nint h, Guid id, Native.RECT? dropBounds=null)
     {
@@ -643,6 +782,7 @@ public sealed class OverviewSession : IDisposable
         // become part of its persisted session state rather than being undone on Exit().
         Placements.SetDesktop(h, id);
         if(dropBounds!=null){Placements.Recapture(h);tileMoved.Remove(h);userMinimized.Remove(h);}
+        presentationOffset.Remove(h); presentedAt.Remove(h);
         docked.Remove(h);
         minimizedDocked.Remove(h);
         minimizedOnEntry.Remove(h);
@@ -733,7 +873,7 @@ public sealed class OverviewSession : IDisposable
         var toMinimize = docked.Where(h => Native.IsWindow(h) && !Native.IsIconic(h)).ToList();
         // Restore behind the still-opaque canvas, then uncover the normal desktop.
         try { Placements.Restore(); foreach (var h in toMinimize) Native.ShowWindowAsync(h, 6); } // SW_MINIMIZE
-        finally { draggingTile=0; Leaving?.Invoke(); positions.Clear(); currentCells.Clear(); arrangeOrder.Clear(); docked.Clear(); settling.Clear(); tileMoved.Clear(); minimizedOnEntry.Clear(); minimizedDocked.Clear(); userMinimized.Clear(); restoreAttempts.Clear(); selfMinimizing.Clear(); restoredSinceAttempt.Clear(); Selected = 0; }
+        finally { draggingTile=0; Leaving?.Invoke(); positions.Clear(); currentCells.Clear(); arrangeOrder.Clear(); docked.Clear(); settling.Clear(); tileMoved.Clear(); minimizedOnEntry.Clear(); minimizedDocked.Clear(); userMinimized.Clear(); restoreAttempts.Clear(); selfMinimizing.Clear(); restoredSinceAttempt.Clear(); presentationOffset.Clear(); presentedAt.Clear(); Selected = 0; }
         if (Native.IsWindow(foreground) && Desktops.IsCurrent(foreground)) Native.SetForegroundWindow(foreground);
     }
     public void Dispose() => Exit();

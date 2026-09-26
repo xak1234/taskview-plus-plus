@@ -33,6 +33,9 @@ public sealed class Settings
     public bool AnimateLayout {get;set;}=true;
     public DesktopTransitionMode DesktopTransition {get;set;}=DesktopTransitionMode.Slide;
     public bool AutoArrange {get;set;}
+    // While a window is dragged, the others slide aside. Pinned windows stay put
+    // either way. Off: the dragged window follows the pointer and nothing else moves.
+    public bool RepelWindows {get;set;}=true;
     // Retired: auto-arrange now uses the Windows 11 Task View layout (TaskViewLayout).
     // Kept so older settings files still load.
     public int AutoArrangeGrid {get;set;}=4;
@@ -40,7 +43,6 @@ public sealed class Settings
     public int MaxBrowsedWindows {get;set;}=2;
     public const int MaxBrowsedWindowsMin=1, MaxBrowsedWindowsMax=5;
     public BackgroundTheme BackgroundTheme {get;set;}=BackgroundTheme.DarkBlueBlack;
-    public bool StartWithWindows {get;set;}
     public bool DockEnabled {get;set;}=true;
     public DockPosition DockPosition {get;set;}=DockPosition.Auto;
     public int SatelliteScale {get;set;}=25;
@@ -54,7 +56,7 @@ public sealed class Settings
     // A window that is already minimized when the overview opens is parked, not in use,
     // so it starts as a docked live view beside the desktop cards instead of a tile.
     public bool DockMinimizedWindows {get;set;}=true;
-    // Pushing a dragged tile into the desktop bar (plasma contact) docks it immediately.
+    // Pushing a dragged tile into the desktop bar (plasma contact) docks it once held there for about a second.
     // Off: the plasma still shows, but a tile docks only when released over the bar.
     public bool DockOnBarContact {get;set;}=true;
     // Electric plasma between a dragged tile and the desktop/dock bar (visual only).
@@ -62,12 +64,18 @@ public sealed class Settings
     // Ask explorer to pin the window to every virtual desktop (IVirtualDesktopPinnedApps)
     // when the user pins it in Taskview++. Off by default since 2026-09-22: every wedged
     // (unkillable, 1-thread) StayView/Checks process that day had exercised this path.
-    // Off, StayView keeps the pin itself and moves the window to follow the desktop.
+    // Off, the window stays on the desktop where it was pinned.
     public bool NativeDesktopPin {get;set;}
+    // Save state: relaunch and place the apps that were open, on the first start after a
+    // reboot or sign-in. Off: state is still saved, nothing is launched.
+    public bool RestoreAppsAfterSignIn {get;set;}=true;
+    // A per-user Run entry (Taskview++) pointing at the running build.
+    public bool StartWithWindows {get;set;}=true;
     public static string Folder=>Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),"StayView");
-    public static Settings Load() {
+    public static Settings Load()=>LoadFrom(Path.Combine(Folder,"settings.json"));
+    public static Settings LoadFrom(string path) {
         try {
-            var settings=JsonSerializer.Deserialize<Settings>(File.ReadAllText(Path.Combine(Folder,"settings.json")))??Fresh();
+            var settings=JsonSerializer.Deserialize<Settings>(File.ReadAllText(path))??Fresh();
             // Older builds used 0 for "CenterTop". The bar is always centered now,
             // so migrate that legacy value to the new Top choice.
             bool legacyStrip=settings.DesktopStripPosition is not DesktopStripPosition.Top and not DesktopStripPosition.Bottom;
@@ -89,6 +97,9 @@ public sealed class Settings
             if(settings.SettingsVersion<1){if(settings.SmallWindowSize==450)settings.SmallWindowSize=SmallWindowSizeDefault;settings.SettingsVersion=1;}
             // One-shot: the old default desktop transition (Appear) adopts the Task View slide.
             if(settings.SettingsVersion<2){if(settings.DesktopTransition==DesktopTransitionMode.Appear)settings.DesktopTransition=DesktopTransitionMode.Slide;settings.SettingsVersion=2;}
+            // One-shot: builds before version 3 persisted an unused StartWithWindows=false that
+            // no UI ever showed. Save state wants it on by default; the user can turn it off.
+            if(settings.SettingsVersion<3){settings.StartWithWindows=true;settings.SettingsVersion=3;}
             if(settings.AutoArrangeGrid is not 2 and not 4 and not 5)settings.AutoArrangeGrid=4;
             settings.MaxBrowsedWindows=Math.Clamp(settings.MaxBrowsedWindows,MaxBrowsedWindowsMin,MaxBrowsedWindowsMax);
             if(!Enum.IsDefined(settings.BackgroundTheme))settings.BackgroundTheme=BackgroundTheme.DarkBlueBlack;
@@ -100,7 +111,7 @@ public sealed class Settings
     static int Closest(int value,params int[] choices)=>choices.OrderBy(x=>Math.Abs(x-value)).First();
     // Settings written by this build are already at the current version, so the one-shot
     // migrations (keyed on SettingsVersion) never rewrite a choice made on a fresh install.
-    public const int CurrentVersion=2;
+    public const int CurrentVersion=3;
     static Settings Fresh()=>new(){SettingsVersion=CurrentVersion};
     // A failed save (e.g. antivirus holding the temp file) is logged, never fatal to the app.
     public void Save() {

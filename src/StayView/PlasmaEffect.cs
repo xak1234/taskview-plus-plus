@@ -25,8 +25,7 @@ sealed class PlasmaEffect
     double barEdge, tileEdge, left, right, target, intensity;
     bool charged;
 
-    static readonly Windows.UI.Color Cyan = Windows.UI.Color.FromArgb(255, 110, 220, 255);
-    static readonly Windows.UI.Color Violet = Windows.UI.Color.FromArgb(255, 180, 120, 255);
+    static readonly Windows.UI.Color ElectricBlue = Windows.UI.Color.FromArgb(255, 110, 220, 255);
 
     public PlasmaEffect(Canvas host)
     {
@@ -43,8 +42,8 @@ sealed class PlasmaEffect
 
     (Polyline, Polyline) NewBolt()
     {
-        var halo = new Polyline { StrokeThickness = 5, StrokeLineJoin = PenLineJoin.Round, Stroke = new SolidColorBrush(Cyan), Opacity = 0 };
-        var core = new Polyline { StrokeThickness = 1.4, StrokeLineJoin = PenLineJoin.Round, Stroke = new SolidColorBrush(Microsoft.UI.Colors.White), Opacity = 0 };
+        var halo = new Polyline { StrokeThickness = 5, StrokeLineJoin = PenLineJoin.Round, Stroke = new SolidColorBrush(ElectricBlue), Opacity = 0 };
+        var core = new Polyline { StrokeThickness = 1.4, StrokeLineJoin = PenLineJoin.Round, Stroke = new SolidColorBrush(ElectricBlue), Opacity = 0 };
         layer.Children.Add(halo); layer.Children.Add(core);
         return (halo, core);
     }
@@ -74,12 +73,11 @@ sealed class PlasmaEffect
         if (target == 0 && intensity < .02) { Stop(); return; }
         double width = Math.Max(1, right - left);
         double dir = Math.Sign(tileEdge - barEdge); if (dir == 0) dir = 1;
-        var colour = charged ? Violet : Cyan;
-
-        // The whole bar surface flickers with charge.
+        // The whole bar surface flickers with charge. Colour stays electric blue
+        // whether or not the tile is pressed hard enough to dock.
         surface.Width = Math.Max(1, bar.Width); surface.Height = Math.Max(1, bar.Height);
         Canvas.SetLeft(surface, bar.Left); Canvas.SetTop(surface, bar.Top);
-        surface.Fill = new SolidColorBrush(Windows.UI.Color.FromArgb(255, colour.R, colour.G, colour.B));
+        surface.Fill = new SolidColorBrush(ElectricBlue);
         surface.Opacity = intensity * (.06 + .10 * random.NextDouble()) * (charged ? 1.6 : 1);
 
         // Glow band along the full length of the bar edge, flickering.
@@ -88,8 +86,8 @@ sealed class PlasmaEffect
         Canvas.SetLeft(glow, bar.Left);
         Canvas.SetTop(glow, dir > 0 ? barEdge - band : barEdge);
         var brush = new LinearGradientBrush { StartPoint = new Point(0, dir > 0 ? 1 : 0), EndPoint = new Point(0, dir > 0 ? 0 : 1) };
-        brush.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(230, colour.R, colour.G, colour.B), Offset = 0 });
-        brush.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, colour.R, colour.G, colour.B), Offset = 1 });
+        brush.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(230, ElectricBlue.R, ElectricBlue.G, ElectricBlue.B), Offset = 0 });
+        brush.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, ElectricBlue.R, ElectricBlue.G, ElectricBlue.B), Offset = 1 });
         glow.Fill = brush;
         glow.Opacity = intensity * (.55 + .45 * random.NextDouble());
 
@@ -102,7 +100,7 @@ sealed class PlasmaEffect
             double x0 = left + width * random.NextDouble();
             double xEnd = Math.Clamp(x0 + (random.NextDouble() - .5) * 60, left, right);
             var points = Bolt(new Point(x0, barEdge), new Point(xEnd, tileEdge), 18 + 10 * intensity);
-            Apply(halo, core, points, colour, intensity * (.6 + .4 * random.NextDouble()));
+            Apply(halo, core, points, ElectricBlue, intensity * (.6 + .4 * random.NextDouble()));
         }
         // Crackle running along the entire bar edge, in segments so each stays jagged.
         double segment = Math.Max(1, bar.Width) / crackle.Count;
@@ -110,7 +108,7 @@ sealed class PlasmaEffect
         {
             var from = new Point(bar.Left + segment * i, barEdge);
             var to = new Point(bar.Left + segment * (i + 1), barEdge);
-            Apply(crackle[i].Halo, crackle[i].Core, Bolt(from, to, 5 + 5 * intensity), colour, intensity * (.6 + .35 * random.NextDouble()));
+            Apply(crackle[i].Halo, crackle[i].Core, Bolt(from, to, 5 + 5 * intensity), ElectricBlue, intensity * (.6 + .35 * random.NextDouble()));
         }
         // Arcs skittering across the bar surface; more when charged.
         int surfaceActive = (int)Math.Round(intensity * surfaceArcs.Count * (charged ? 1 : .7));
@@ -122,7 +120,7 @@ sealed class PlasmaEffect
             double x0 = bar.Left + random.NextDouble() * Math.Max(1, bar.Width - length);
             double y0 = bar.Top + bar.Height * (.15 + .7 * random.NextDouble());
             double y1 = Math.Clamp(y0 + (random.NextDouble() - .5) * bar.Height * .6, bar.Top + 2, bar.Bottom - 2);
-            Apply(halo, core, Bolt(new Point(x0, y0), new Point(x0 + length, y1), 10 + 12 * intensity), colour, intensity * (.35 + .4 * random.NextDouble()));
+            Apply(halo, core, Bolt(new Point(x0, y0), new Point(x0 + length, y1), 10 + 12 * intensity), ElectricBlue, intensity * (.35 + .4 * random.NextDouble()));
         }
     }
 

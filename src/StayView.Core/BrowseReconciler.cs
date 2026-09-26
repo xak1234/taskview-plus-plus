@@ -47,17 +47,26 @@ public static class BrowseReconciler
     // blindly interpret that foreground change as a StayView gesture we can resurrect the
     // closing HWND and bounce focus between it and the canvas. `ownCanvasGesture` is true
     // only for a completed StayView tile drag that intentionally caused this handoff.
+    //
+    // Nor is it a reason to drop to the grid. An empty-canvas press returns to the grid on
+    // its own path. The canvas also takes the foreground when a press lands on the focused
+    // window's full-size stand-in, or WinUI activates the island; the grid then looked like
+    // the focused window dropping out by itself. So wait: a closing window is gone by the
+    // next pass and the caller returns to the grid. `canvasSettled` means the canvas has
+    // held the foreground past that wait while the selected window is still here, so it
+    // goes back in front.
     public static BrowseTarget ClassifyForeground(
         nint selected,
         nint foreground,
         nint foregroundRoot,
         bool foregroundIsOwnCanvas,
         bool ownCanvasGesture,
-        nint foregroundSource)
+        nint foregroundSource,
+        bool canvasSettled = false)
     {
         if (foreground == 0) return BrowseTarget.Keep; // transient activation handoff
         if (selected != 0 && (foreground == selected || foregroundRoot == selected)) return BrowseTarget.Keep;
-        if (foregroundIsOwnCanvas) return ownCanvasGesture ? BrowseTarget.Refront : BrowseTarget.Grid;
+        if (foregroundIsOwnCanvas) return ownCanvasGesture || canvasSettled ? BrowseTarget.Refront : BrowseTarget.Keep;
         if (foregroundSource != 0 && foregroundSource != selected) return BrowseTarget.Follow;
         return BrowseTarget.Grid;
     }

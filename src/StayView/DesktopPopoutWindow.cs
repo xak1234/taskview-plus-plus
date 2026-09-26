@@ -34,6 +34,9 @@ sealed class DesktopPopoutWindow : Window
     // Keyed by source window so a refresh can reuse thumbnails instead of unregistering
     // and re-registering them all, which made the panel flicker whenever a window moved.
     readonly Dictionary<nint, nint> thumbBySource = [];
+    // Windows whose frame attributes were changed so a popout thumbnail does not
+    // paint that frame on the current desktop.
+    readonly HashSet<nint> frameSuppressed = [];
     readonly List<(nint Handle, Native.RECT Rect)> windowRects = []; // client physical px
     nint dragPreviewThumb;
     nint dragPreviewSource;
@@ -42,7 +45,7 @@ sealed class DesktopPopoutWindow : Window
     double scale = 1;
     string contentSig = "";
     bool suspended;
-    bool pinned;
+
     // The popout is a view of the monitor it was created from, not whichever monitor
     // the floating panel happens to be sitting on now. Re-resolving the source monitor
     // from Handle while dragging the panel across a monitor boundary made every source
@@ -221,7 +224,10 @@ sealed class DesktopPopoutWindow : Window
         Layout();
         frame.UpdateLayout();
         AppWindow.Show(false);
-        if (!pinned) pinned = session.Desktops.PinOwnWindow(Handle);
+        // Do not pin this panel to every desktop. A pinned host is what makes Windows
+        // draw the previewed windows' own frames on the desktop the user is looking at.
+        // The panel is moved onto whichever desktop is current instead.
+        FollowCurrentDesktop();
         BringToFront();
     }
 
@@ -235,6 +241,7 @@ sealed class DesktopPopoutWindow : Window
         suspended = true;
         ClearDragPreview();
         bodyPressed=false;bodyWindow=0;body.ReleasePointerCaptures();WindowDragEnded?.Invoke();
+        RestoreSuppressedFrames();
         AppWindow.Hide();
     }
 
@@ -243,9 +250,16 @@ sealed class DesktopPopoutWindow : Window
         if (!suspended) return;
         suspended = false;
         AppWindow.Show(false);
-        if (!pinned) pinned = session.Desktops.PinOwnWindow(Handle);
+        FollowCurrentDesktop();
         BringToFront();
         Refresh();
+    }
+
+    public void FollowCurrentDesktop()
+    {
+        var id = session.Desktops.Current;
+        if (id == Guid.Empty || id == desktopId) return;
+        session.Desktops.MoveOwnWindow(Handle, id);
     }
 
     void StartGesture(int mode, PointerRoutedEventArgs e, UIElement el)
@@ -292,6 +306,12 @@ sealed class DesktopPopoutWindow : Window
         bodyWindow = 0;
         for (int i = windowRects.Count - 1; i >= 0; i--)
             if (Contains(windowRects[i].Rect, local)) { bodyWindow = windowRects[i].Handle; break; }
+        if (bodyWindow != 0 && InCloseCorner(local))
+        {
+            session.Close(bodyWindow);
+            e.Handled = true;
+            return;
+        }
         if (bodyWindow != 0 && !Native.GetWindowRect(bodyWindow, out bodyWindowStart)) bodyWindow = 0;
         if(bodyWindow!=0 && (Native.IsIconic(bodyWindow)||Native.IsZoomed(bodyWindow)))
             bodyWindowStart=Native.Placement(bodyWindow).NormalPosition;
@@ -342,6 +362,7 @@ sealed class DesktopPopoutWindow : Window
             WindowDragEnded?.Invoke();
             if(source!=0 && bodyStartDesktop!=Guid.Empty && session.Desktops.Current==bodyStartDesktop)
             {
+                RestoreSuppressedFrame(source);
                 if(ContainsScreenPoint(drop))session.MoveToDesktop(source,desktopId,bodyWindowTarget);
                 else ExternalWindowDrop?.Invoke(source,drop);
             }
@@ -438,8 +459,9 @@ sealed class DesktopPopoutWindow : Window
         if (gestureMode != 0 || bodyPressed) return;
         var windows = Snapshot();
         var sig = Signature(windows);
-        if (sig == contentSig) return;
+        if (sig == contentSig) { HideLeakedFrames(); return; }
         Compose(windows);
+        HideLeakedFrames();
     }
 
     IEnumerable<nint> DesktopWindows() => session.DesktopWindows()
@@ -462,11 +484,20 @@ sealed class DesktopPopoutWindow : Window
         return (minWidth,maxWidth,minHeight,maxHeight);
     }
 
-    List<(nint Handle, Native.RECT Bounds)> Snapshot()
+    List<(nint Handle, Native.RECT Visible, Native.RECT Full)> Snapshot()
     {
         var screen = SourceScreen();
-        return DesktopWindows().Select(h => (Handle: h, Bounds: Native.GetWindowRect(h, out var r) ? r : default))
-            .Where(w => w.Bounds.Width > 0 && w.Bounds.Height > 0 && w.Bounds.Intersects(screen)).ToList();
+        var list = new List<(nint Handle, Native.RECT Visible, Native.RECT Full)>();
+        foreach (var h in DesktopWindows())
+        {
+            if (!Native.GetWindowRect(h, out var full) || full.Width < 1 || full.Height < 1) continue;
+            // GetWindowRect includes the invisible resize margin. Drawing that margin
+            // is the empty blue border that sticks out above or below the next window.
+            var visible = Native.TryGetVisualBounds(h, out var frame) && frame.Width > 1 && frame.Height > 1 ? frame : full;
+            if (!visible.Intersects(screen)) continue;
+            list.Add((h, visible, full));
+        }
+        return list;
     }
     public Native.RECT DropBounds(nint source,Native.POINT point)
     {
@@ -478,10 +509,10 @@ sealed class DesktopPopoutWindow : Window
         if(Native.IsIconic(source)||Native.IsZoomed(source))bounds=Native.Placement(source).NormalPosition;
         return DesktopDropGeometry.AtPoint(bounds,location,screen);
     }
-    static string Signature(IEnumerable<(nint Handle, Native.RECT Bounds)> windows) =>
-        string.Join("|", windows.Select(w => $"{w.Handle}:{w.Bounds.Left},{w.Bounds.Top},{w.Bounds.Width},{w.Bounds.Height}"));
+    static string Signature(IEnumerable<(nint Handle, Native.RECT Visible, Native.RECT Full)> windows) =>
+        string.Join("|", windows.Select(w => $"{w.Handle}:{w.Visible.Left},{w.Visible.Top},{w.Visible.Width},{w.Visible.Height}"));
 
-    void Compose(List<(nint Handle, Native.RECT Bounds)> windows)
+    void Compose(List<(nint Handle, Native.RECT Visible, Native.RECT Full)> windows)
     {
         windowRects.Clear();
         var live = new HashSet<nint>();
@@ -490,7 +521,6 @@ sealed class DesktopPopoutWindow : Window
         // Back-to-front so overlapping windows composite in the right order.
         foreach (var w in windows.AsEnumerable().Reverse())
         {
-            var source = w.Bounds;
             // Reuse the existing registration; re-registering every pass is what flickered.
             if (!thumbBySource.TryGetValue(w.Handle, out var thumb))
             {
@@ -498,15 +528,20 @@ sealed class DesktopPopoutWindow : Window
                 if (reg != 0) { Log.Write($"Popout thumbnail registration failed 0x{reg:X} for {Native.Title(w.Handle)} ({w.Handle})"); continue; }
                 thumbBySource[w.Handle] = thumb;
             }
-            if (TryPositionWindowThumb(w.Handle, thumb, source, content, screen, out var clip))
+            if (TryPositionWindowThumb(w.Handle, thumb, w.Visible, w.Full, content, screen, out var clip))
             { live.Add(w.Handle); windowRects.Add((w.Handle, clip)); }
         }
         // Unregister only windows that have left this desktop; everything else keeps its
         // registration, so a window moving just repositions the thumbnail it already has.
         foreach (var gone in thumbBySource.Keys.Where(k => !live.Contains(k)).ToList())
-        { Native.DwmUnregisterThumbnail(thumbBySource[gone]); thumbBySource.Remove(gone); }
+        {
+            Native.DwmUnregisterThumbnail(thumbBySource[gone]);
+            thumbBySource.Remove(gone);
+            RestoreSuppressedFrame(gone);
+        }
         // Retry transient DWM registration/update failures on the next refresh.
         contentSig = live.Count == windows.Count ? Signature(windows) : "";
+        HideLeakedFrames();
     }
 
     Native.RECT PopoutContentRect()
@@ -515,12 +550,22 @@ sealed class DesktopPopoutWindow : Window
         int headerPx = (int)Math.Round(HeaderH * scale), sidePx = (int)Math.Round(SideInset * scale), gripPx = (int)Math.Round(GripReserve * scale);
         return new Native.RECT(sidePx, headerPx, Math.Max(1, client.Width - 2 * sidePx), Math.Max(1, client.Height - headerPx - gripPx));
     }
-    void UpdateWindowVisual(nint h, Native.RECT source)
+    void UpdateWindowVisual(nint h, Native.RECT fullTarget)
     {
         if (!thumbBySource.TryGetValue(h, out var thumb)) return;
         var content = PopoutContentRect();
         var screen = SourceScreen();
-        if (!TryPositionWindowThumb(h, thumb, source, content, screen, out var clip)) return;
+        var visible = fullTarget;
+        if (Native.GetWindowRect(h, out var fullNow) && Native.TryGetVisualBounds(h, out var visibleNow)
+            && fullNow.Width > 1 && visibleNow.Width > 1)
+        {
+            int left = visibleNow.Left - fullNow.Left, top = visibleNow.Top - fullNow.Top;
+            int right = fullNow.Right - visibleNow.Right, bottom = fullNow.Bottom - visibleNow.Bottom;
+            visible = new Native.RECT(fullTarget.Left + left, fullTarget.Top + top,
+                Math.Max(1, fullTarget.Width - left - right), Math.Max(1, fullTarget.Height - top - bottom));
+        }
+        if (!TryPositionWindowThumb(h, thumb, visible, fullTarget, content, screen, out var clip)) return;
+        SuppressFrame(h);
         int i = windowRects.FindIndex(x => x.Handle == h);
         if (i >= 0) windowRects[i] = (h, clip); else windowRects.Add((h, clip));
     }
@@ -530,24 +575,79 @@ sealed class DesktopPopoutWindow : Window
         var monitor=Native.MonitorFromWindow(Handle,2);
         return monitor!=0?Native.MonitorBounds(monitor):new Native.RECT(0,0,1,1);
     }
-    static bool TryPositionWindowThumb(nint h, nint thumb, Native.RECT source, Native.RECT content, Native.RECT screen, out Native.RECT clip)
+    static bool TryPositionWindowThumb(nint h, nint thumb, Native.RECT visible, Native.RECT full, Native.RECT content, Native.RECT screen, out Native.RECT clip)
     {
         var dest = new Native.RECT(
-            content.Left + (int)Math.Round((source.Left - screen.Left) * content.Width / (double)Math.Max(1, screen.Width)),
-            content.Top + (int)Math.Round((source.Top - screen.Top) * content.Height / (double)Math.Max(1, screen.Height)),
-            Math.Max(1, (int)Math.Round(source.Width * content.Width / (double)Math.Max(1, screen.Width))),
-            Math.Max(1, (int)Math.Round(source.Height * content.Height / (double)Math.Max(1, screen.Height))));
+            content.Left + (int)Math.Round((visible.Left - screen.Left) * content.Width / (double)Math.Max(1, screen.Width)),
+            content.Top + (int)Math.Round((visible.Top - screen.Top) * content.Height / (double)Math.Max(1, screen.Height)),
+            Math.Max(1, (int)Math.Round(visible.Width * content.Width / (double)Math.Max(1, screen.Width))),
+            Math.Max(1, (int)Math.Round(visible.Height * content.Height / (double)Math.Max(1, screen.Height))));
         clip = DockView.Intersect(dest, content);
         if (clip.Width < 1 || clip.Height < 1) return false;
         if (Native.DwmQueryThumbnailSourceSize(thumb, out var size) != 0 || size.X < 1 || size.Y < 1) return false;
-        var crop = new Native.RECT((int)((clip.Left - dest.Left) * size.X / (double)dest.Width), (int)((clip.Top - dest.Top) * size.Y / (double)dest.Height),
-            Math.Max(1, (int)(clip.Width * size.X / (double)dest.Width)), Math.Max(1, (int)(clip.Height * size.Y / (double)dest.Height)));
+        // The thumbnail bitmap covers the outer window rectangle. Crop to the visible
+        // frame so the invisible margin is not drawn as an empty border.
+        double u0 = (clip.Left - dest.Left) / (double)Math.Max(1, dest.Width);
+        double v0 = (clip.Top - dest.Top) / (double)Math.Max(1, dest.Height);
+        double u1 = (clip.Right - dest.Left) / (double)Math.Max(1, dest.Width);
+        double v1 = (clip.Bottom - dest.Top) / (double)Math.Max(1, dest.Height);
+        double fullW = Math.Max(1, full.Width), fullH = Math.Max(1, full.Height);
+        int srcX = (int)Math.Round((visible.Left + u0 * visible.Width - full.Left) / fullW * size.X);
+        int srcY = (int)Math.Round((visible.Top + v0 * visible.Height - full.Top) / fullH * size.Y);
+        int srcR = (int)Math.Round((visible.Left + u1 * visible.Width - full.Left) / fullW * size.X);
+        int srcB = (int)Math.Round((visible.Top + v1 * visible.Height - full.Top) / fullH * size.Y);
+        srcX = Math.Clamp(srcX, 0, size.X - 1);
+        srcY = Math.Clamp(srcY, 0, size.Y - 1);
+        srcR = Math.Clamp(srcR, srcX + 1, size.X);
+        srcB = Math.Clamp(srcB, srcY + 1, size.Y);
+        var crop = new Native.RECT(srcX, srcY, srcR - srcX, srcB - srcY);
         var props = new Native.THUMBNAIL { Flags = 31, Destination = clip, Source = crop, Visible = true, Opacity = 255, SourceClientOnly = false };
         bool ok = Native.DwmUpdateThumbnailProperties(thumb, ref props) == 0;
         if (!ok) Log.Write($"Popout thumbnail update failed for {Native.Title(h)} ({h})");
         return ok;
     }
 
-    void ClearThumbs() { foreach (var t in thumbBySource.Values) Native.DwmUnregisterThumbnail(t); thumbBySource.Clear(); }
+    void ClearThumbs()
+    {
+        foreach (var t in thumbBySource.Values) Native.DwmUnregisterThumbnail(t);
+        thumbBySource.Clear();
+        RestoreSuppressedFrames();
+    }
+    void HideLeakedFrames()
+    {
+        foreach (var h in thumbBySource.Keys) SuppressFrame(h);
+    }
+    void SuppressFrame(nint h)
+    {
+        if (!Native.IsWindow(h) || frameSuppressed.Contains(h) || session.Desktops.IsWindowPinned(h)) return;
+        var current = session.Desktops.Current;
+        var owner = session.Desktops.WindowDesktop(h);
+        if (owner == Guid.Empty || current == Guid.Empty || owner == current) return;
+        Native.SuppressThumbnailGhostFrame(h);
+        frameSuppressed.Add(h);
+    }
+    void RestoreSuppressedFrame(nint h)
+    {
+        if (!frameSuppressed.Remove(h) || !Native.IsWindow(h)) return;
+        Native.RestoreThumbnailGhostFrame(h);
+    }
+    void RestoreSuppressedFrames()
+    {
+        foreach (var h in frameSuppressed.ToList()) RestoreSuppressedFrame(h);
+    }
     static bool Contains(Native.RECT r, Native.POINT p) => p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom;
+    bool InCloseCorner(Native.POINT local)
+    {
+        if (bodyWindow == 0 || (Native.GetWindowLongPtr(bodyWindow, -16).ToInt64() & 0x00C00000L) == 0) return false;
+        for (int i = windowRects.Count - 1; i >= 0; i--)
+        {
+            if (windowRects[i].Handle != bodyWindow) continue;
+            var cell = windowRects[i].Rect;
+            if (cell.Width < 48 || cell.Height < 36) return false;
+            int bw = Math.Clamp(cell.Width / 7, 14, 48);
+            int bh = Math.Clamp(cell.Height / 8, 12, 32);
+            return local.X >= cell.Right - bw && local.X < cell.Right && local.Y >= cell.Top && local.Y < cell.Top + bh;
+        }
+        return false;
+    }
 }

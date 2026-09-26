@@ -102,7 +102,208 @@ var topCorrected=FocusedWindowGeometry.ClampVisibleTop(userRect,visualRect,topWo
 if(topCorrected.Top!=41||topCorrected.Width!=userRect.Width||topCorrected.Height!=userRect.Height)throw new Exception("Focused visible-top clamp");
 var targetCorrected=FocusedWindowGeometry.ClampTargetTop(new Native.RECT(-1500,-80,900,700),topWork);
 if(targetCorrected.Top!=48||targetCorrected.Width!=900||targetCorrected.Height!=700)throw new Exception("Focused animation-top clamp");
+var desk=new Native.RECT(0,0,1000,800);
+var shifted=FocusedWindowGeometry.FitInside(new Native.RECT(-40,-20,500,400),desk);
+if(shifted.Left!=0||shifted.Top!=0||shifted.Width!=500||shifted.Height!=400||shifted.Right>desk.Right||shifted.Bottom>desk.Bottom)throw new Exception("Focused window must slide fully inside");
+var fitted=FocusedWindowGeometry.FitInside(new Native.RECT(-100,-80,1400,1200),desk);
+if(fitted.Left!=0||fitted.Top!=0||fitted.Width!=1000||fitted.Height!=800)throw new Exception("Oversized focused window must shrink inside the desktop");
+var framed=FocusedWindowGeometry.FitWindowInside(new Native.RECT(-50,-10,520,420),new Native.RECT(-42,-2,500,400),desk);
+if(framed.Left!=-8||framed.Top!=-8||framed.Width!=520||framed.Height!=420)throw new Exception("Visible frame must sit inside while resize margins stay attached");
+var topBar=new Native.RECT(8,8,984,180);
+var bottomBar=new Native.RECT(8,612,984,180);
+var underTopBar=FocusedWindowGeometry.MoveOffBar(new Native.RECT(100,50,520,420),8,0,504,412,topBar,desk);
+if(underTopBar.Top!=188||underTopBar.Left!=100||underTopBar.Width!=520||underTopBar.Height!=420)throw new Exception("A top desktop bar must push the frame down to its bottom edge");
+var clearOfBar=new Native.RECT(100,300,520,420);
+if(!FocusedWindowGeometry.MoveOffBar(clearOfBar,8,0,504,412,topBar,desk).Equals(clearOfBar))throw new Exception("A frame clear of the bar must not move");
+var tallUnderTopBar=FocusedWindowGeometry.MoveOffBar(new Native.RECT(100,0,520,900),8,0,504,890,topBar,desk);
+if(tallUnderTopBar.Top!=188||tallUnderTopBar.Height!=900)throw new Exception("A tall window must never be resized by the bar; it runs past the bottom instead");
+var aboveBottomBar=FocusedWindowGeometry.MoveOffBar(new Native.RECT(100,650,520,420),8,0,504,412,bottomBar,desk);
+if(aboveBottomBar.Top!=200||aboveBottomBar.Height!=420)throw new Exception("A bottom desktop bar must push the frame up to its top edge");
+var tallAboveBottomBar=FocusedWindowGeometry.MoveOffBar(new Native.RECT(100,300,520,710),8,0,504,700,bottomBar,desk);
+if(tallAboveBottomBar.Top!=0||tallAboveBottomBar.Height!=710)throw new Exception("A frame taller than the space above a bottom bar keeps its title bar on screen");
+var otherMonitor=new Native.RECT(1100,50,520,420);
+if(!FocusedWindowGeometry.MoveOffBar(otherMonitor,8,0,504,412,topBar,desk).Equals(otherMonitor))throw new Exception("A frame beside the bar (another monitor) must move freely");
+var offScreenLeft=new Native.RECT(-300,300,520,420);
+if(!FocusedWindowGeometry.MoveOffBar(offScreenLeft,8,0,504,412,topBar,desk).Equals(offScreenLeft))throw new Exception("Only the bar edge is enforced; a frame may hang off the other edges");
+var noBar=new Native.RECT(100,50,520,420);
+if(!FocusedWindowGeometry.MoveOffBar(noBar,8,0,504,412,default,desk).Equals(noBar))throw new Exception("No desktop bar leaves the window alone");
+foreach(int hit in new[]{3,4,9,10,13,17,18})if(FocusedClickPolicy.PinReplaysClick(hit))throw new Exception($"A click on hit {hit} must never be replayed onto a pinned window");
+foreach(int? hit in new int?[]{null,2,5,6,7})if(!FocusedClickPolicy.PinReplaysClick(hit))throw new Exception($"A stationary click on hit {hit} must still reach a pinned window");
+var overTile=FocusedWindowGeometry.CenterOver(new Native.RECT(600,300,420,320),new Native.RECT(610,300,400,310),new Native.RECT(100,300,200,150),desk);
+if(overTile.Left!=-10||overTile.Top!=220||overTile.Width!=420||overTile.Height!=320)throw new Exception("Focus must centre the visible frame on its tile");
+var overEdgeTile=FocusedWindowGeometry.CenterOver(new Native.RECT(0,0,420,320),new Native.RECT(10,0,400,310),new Native.RECT(900,700,100,80),desk);
+if(overEdgeTile.Left!=590||overEdgeTile.Top!=490)throw new Exception("A tile near the edge must expand inside the work area");
 Console.WriteLine("PASS: focused windows keep a 15% configured-size floor while preserving the opposite resize edge.");
+// Helper processes live in a kill-on-close job: when the owner goes away (clean exit,
+// crash, or killed), Windows terminates them even if they are stuck and never notice.
+{
+    var sleeper=System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("ping.exe","-n 60 127.0.0.1"){UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true})!;
+    try
+    {
+        var job=new ChildProcessJob();
+        if(!job.Track(sleeper))throw new Exception("A helper process must be assignable to the kill-on-close job");
+        if(sleeper.HasExited)throw new Exception("Tracking a helper must not end it");
+        job.Dispose();
+        if(!sleeper.WaitForExit(3000))throw new Exception("Closing the job must terminate every helper in it");
+    }
+    finally{try{if(!sleeper.HasExited)sleeper.Kill();}catch{}}
+    Console.WriteLine("PASS: helper processes die with the kill-on-close job.");
+}
+{
+    const string testValue="StayView.Checks.StartupTest";
+    StartupRegistration.Apply(true,@"C:\x\StayView.exe",testValue);
+    if(StartupRegistration.Current(testValue)!="\"C:\\x\\StayView.exe\"")throw new Exception("Start with Windows must register the quoted exe path");
+    StartupRegistration.Apply(false,@"C:\x\StayView.exe",testValue);
+    if(StartupRegistration.Current(testValue)!=null)throw new Exception("Turning Start with Windows off must remove the entry");
+    var fresh=new Settings();
+    if(!fresh.RestoreAppsAfterSignIn||!fresh.StartWithWindows)throw new Exception("Both session toggles default to on");
+    // Builds before settings version 3 persisted an unused, never-shown StartWithWindows=false.
+    var oldPath=Path.Combine(Path.GetTempPath(),"stayview-settings-v2.json");
+    File.WriteAllText(oldPath,"{\"SettingsVersion\":2,\"StartWithWindows\":false}");
+    var migrated=Settings.LoadFrom(oldPath);
+    if(!migrated.StartWithWindows||migrated.SettingsVersion<3)throw new Exception("The never-shown StartWithWindows=false from older builds migrates to on");
+    File.WriteAllText(oldPath,"{\"SettingsVersion\":3,\"StartWithWindows\":false}");
+    if(Settings.LoadFrom(oldPath).StartWithWindows)throw new Exception("A StartWithWindows the user turned off stays off");
+    File.Delete(oldPath);
+    Console.WriteLine("PASS: Start with Windows registers and removes itself; session toggles default on.");
+}
+{
+    var path=Path.Combine(Path.GetTempPath(),"stayview-workspace-check.json");
+    var placement=new Native.WINDOWPLACEMENT{Length=44,ShowCmd=1,NormalPosition=new Native.RECT(10,20,300,200)};
+    var w=new SavedWindow(@"C:\Windows\notepad.exe","notepad.exe a.txt","42:1",null,"Notepad","a.txt - Notepad",Guid.NewGuid(),placement,0,true,true,false,false,Guid.Empty,default,false,false);
+    var file=new WorkspaceFile(new SessionKey(123,456),[w]);
+    if(!WorkspaceStore.Save(file,path))throw new Exception("Workspace must save");
+    var back=WorkspaceStore.Load(path)!;
+    if(back.Session!=file.Session||back.Windows.Count!=1||back.Windows[0].CommandLine!="notepad.exe a.txt"||back.Windows[0].Placement.NormalPosition.Width!=300||!back.Windows[0].DockLeft)
+        throw new Exception("Workspace must round-trip");
+    File.WriteAllText(path,"{not json");
+    if(WorkspaceStore.Load(path)!=null)throw new Exception("A corrupt workspace file loads as nothing saved");
+    File.Delete(path);
+    if(WorkspaceStore.Load(path)!=null)throw new Exception("A missing workspace file loads as nothing saved");
+    var now=SessionKey.Current();
+    if(now!=SessionKey.Current()||now.BootMinuteUtc==0)throw new Exception("The current session key is stable within a session");
+    Console.WriteLine("PASS: workspace state round-trips; corrupt or missing files load as nothing saved.");
+}
+{
+    if(!ProcessInfo.TryRead((uint)Environment.ProcessId,out var exe,out var cmd,out var key))throw new Exception("The own process must be readable");
+    if(!string.Equals(exe,Environment.ProcessPath,StringComparison.OrdinalIgnoreCase))throw new Exception("Process image path must be the exe path");
+    if(!cmd.Contains(Path.GetFileNameWithoutExtension(exe),StringComparison.OrdinalIgnoreCase))throw new Exception("The command line must name the exe");
+    if(!key.StartsWith(Environment.ProcessId+":"))throw new Exception("The process key is pid:start");
+    // The real command line, not the "\"exe\"" fallback: a child started with a known argument.
+    var child=System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("ping.exe","-n 30 127.0.0.77"){UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true})!;
+    try
+    {
+        Thread.Sleep(200);
+        if(!ProcessInfo.TryRead((uint)child.Id,out _,out var childCmd,out _)||!childCmd.Contains("127.0.0.77"))
+            throw new Exception("The full command line (arguments included) must be read from another process");
+    }
+    finally{try{child.Kill();}catch{}}
+    if(!ProcessInfo.IsPackaged(@"C:\Program Files\WindowsApps\Microsoft.WindowsCalculator_1.0\CalculatorApp.exe")
+        ||!ProcessInfo.IsPackaged(@"C:\Windows\System32\ApplicationFrameHost.exe")
+        ||ProcessInfo.IsPackaged(@"C:\Windows\notepad.exe"))throw new Exception("Only Store/packaged apps are excluded");
+    if(!ProcessInfo.IsBrowser(@"C:\x\chrome.exe")||!ProcessInfo.IsBrowser(@"C:\x\MSEDGE.EXE")||ProcessInfo.IsBrowser(@"C:\x\notepad.exe"))throw new Exception("Browser detection by exe name");
+    if(!ProcessInfo.IsExplorer(@"C:\Windows\explorer.exe"))throw new Exception("Explorer detection by exe name");
+    Console.WriteLine("PASS: process image, command line and app kinds are read correctly.");
+}
+{
+    SavedWindow W(string exe,string cmd,string key,string cls,string title,string? folder=null)=>
+        new(exe,cmd,key,folder,cls,title,Guid.Empty,default,0,false,false,false,false,Guid.Empty,default,false,false);
+    var saved=new List<SavedWindow>{
+        W(@"C:\b\chrome.exe","\"C:\\b\\chrome.exe\" --profile-directory=Default","1:1","Chrome_WidgetWin_1","A - Chrome"),
+        W(@"C:\b\chrome.exe","\"C:\\b\\chrome.exe\" --profile-directory=Default","1:1","Chrome_WidgetWin_1","B - Chrome"),
+        W(@"C:\n\notepad.exe","\"C:\\n\\notepad.exe\" C:\\a.txt","2:1","Notepad","a.txt - Notepad"),
+        W(@"C:\n\notepad.exe","\"C:\\n\\notepad.exe\" C:\\b.txt","3:1","Notepad","b.txt - Notepad"),
+        W(@"C:\Windows\explorer.exe","C:\\Windows\\Explorer.EXE","4:1","CabinetWClass","Docs",@"C:\Docs"),
+        W(@"C:\Windows\explorer.exe","C:\\Windows\\Explorer.EXE","4:1","CabinetWClass","Open",@"C:\Open"),
+        W(@"C:\gone\old.exe","old.exe","5:1","Old","Old"),
+        W(@"C:\run\running.exe","running.exe","6:1","R","Running"),
+    };
+    var running=new HashSet<string>(StringComparer.OrdinalIgnoreCase){@"C:\run\running.exe",@"C:\Windows\explorer.exe"};
+    var openFolders=new HashSet<string>(StringComparer.OrdinalIgnoreCase){@"C:\Open"};
+    var plan=WorkspacePlan.Plan(saved,running,openFolders,exe=>!exe.StartsWith(@"C:\gone"));
+    if(plan.Count(l=>l.Exe.EndsWith("chrome.exe"))!=1)throw new Exception("A browser is launched once, it restores its own windows");
+    if(plan.Count(l=>l.Exe.EndsWith("notepad.exe"))!=2||!plan.Any(l=>l.Arguments.Contains("a.txt"))||!plan.Any(l=>l.Arguments.Contains("b.txt")))throw new Exception("Each saved process is launched with its own arguments");
+    if(plan.Count(l=>l.Exe.EndsWith("explorer.exe"))!=1||plan.Single(l=>l.Exe.EndsWith("explorer.exe")).Arguments!="\"C:\\Docs\"")throw new Exception("Explorer reopens each saved folder that is not already open");
+    if(plan.Any(l=>l.Exe.StartsWith(@"C:\gone"))||plan.Any(l=>l.Exe.StartsWith(@"C:\run")))throw new Exception("Missing and already-running exes are never launched");
+    if(WorkspacePlan.ArgumentsOf("\"C:\\n\\notepad.exe\" C:\\a.txt")!="C:\\a.txt"||WorkspacePlan.ArgumentsOf("notepad.exe  x")!="x"||WorkspacePlan.ArgumentsOf("notepad.exe")!="")throw new Exception("Arguments are the command line after the exe");
+    var many=Enumerable.Range(0,40).Select(i=>W($@"C:\a\app{i}.exe",$"app{i}.exe",$"{100+i}:1","C","T")).ToList();
+    if(WorkspacePlan.Plan(many,new HashSet<string>(),new HashSet<string>(),_=>true).Count!=WorkspacePlan.MaxLaunches)throw new Exception("Launches are capped");
+
+    var live=new List<LiveWindow>{
+        new(11,@"C:\n\notepad.exe","Notepad","b.txt - Notepad"),
+        new(12,@"C:\n\notepad.exe","Notepad","a.txt - Notepad"),
+        new(13,@"C:\b\chrome.exe","Chrome_WidgetWin_1","A - Chrome"),
+    };
+    var matched=WorkspacePlan.Match(saved,live);
+    if(matched.Single(m=>m.Saved.Title=="a.txt - Notepad").Handle!=12||matched.Single(m=>m.Saved.Title=="b.txt - Notepad").Handle!=11)throw new Exception("Same exe and class are matched by title");
+    if(matched.Select(m=>m.Handle).Distinct().Count()!=matched.Count)throw new Exception("A live window is matched at most once");
+    if(matched.Count(m=>m.Saved.Exe.EndsWith("chrome.exe"))!=1||matched.Single(m=>m.Saved.Exe.EndsWith("chrome.exe")).Saved.Title!="A - Chrome")throw new Exception("The closest title wins");
+
+    var gate=new WorkspaceSaveGate();
+    if(!gate.AllowExitSave())throw new Exception("A normal exit saves");
+    // Every WM_QUERYENDSESSION saves (apps are all still open then); a cancelled shutdown
+    // (WM_ENDSESSION with wParam FALSE) re-enables the normal saves.
+    if(!gate.BeginShutdownSave()||!gate.BeginShutdownSave())throw new Exception("Every session-end notice saves");
+    if(gate.AllowExitSave()||!gate.SessionEnding)throw new Exception("After a shutdown save the exit save is skipped");
+    gate.SessionEndCancelled();
+    if(!gate.AllowExitSave()||gate.SessionEnding)throw new Exception("A cancelled shutdown must not leave saving switched off");
+    Console.WriteLine("PASS: launch plan (browser once, per process, Explorer folders, cap, missing/running skipped), one-to-one matching, shutdown save gate.");
+}
+// Final-review fixes: safe relaunch arguments, transient exes, background-only processes,
+// strict title matching, session identity with clock tolerance and a restored marker,
+// malformed state files.
+{
+    SavedWindow S(string exe,string cmd,string key,string cls="C",string title="T")=>
+        new(exe,cmd,key,null,cls,title,Guid.Empty,default,0,false,false,false,false,Guid.Empty,default,false,false);
+    // argv0 is stripped by the saved exe path, quoted or not, even with spaces.
+    if(WorkspacePlan.ArgumentsOf(@"C:\Program Files\App\app.exe --x",@"C:\Program Files\App\app.exe")!="--x")throw new Exception("An unquoted argv0 with spaces is stripped by the exe path");
+    // One-shot and transient arguments are never replayed.
+    var zoom=WorkspacePlan.Plan([S(@"C:\z\Zoom.exe","\"C:\\z\\Zoom.exe\" \"--url=zoommtg://zoom.us/join?confno=1&pwd=x\"","1:1")],new HashSet<string>(),new HashSet<string>(),_=>true);
+    if(zoom.Count!=1||zoom[0].Arguments!="")throw new Exception("A meeting/URL launch argument is never replayed");
+    var doc=WorkspacePlan.Plan([S(@"C:\n\notepad.exe","\"C:\\n\\notepad.exe\" \"C:\\docs\\a b.txt\" --single-argument https://x.y","2:1")],new HashSet<string>(),new HashSet<string>(),_=>true);
+    if(doc[0].Arguments!="\"C:\\docs\\a b.txt\"")throw new Exception("Document arguments survive, quoted; URL and transient switches are dropped");
+    // Browsers restore their own session: launched with no arguments.
+    var edge=WorkspacePlan.Plan([S(@"C:\e\msedge.exe","\"C:\\e\\msedge.exe\" --no-startup-window --win-session-start","3:1")],new HashSet<string>(),new HashSet<string>(),_=>true);
+    if(edge.Count!=1||edge[0].Arguments!="")throw new Exception("A browser is launched bare so it restores its own windows");
+    // Installers and anything under temp/downloads never come back.
+    foreach(var exe in new[]{Path.Combine(Path.GetTempPath(),"x","tool.exe"),@"C:\Users\u\Downloads\thing.exe",@"C:\p\MySetup.exe",@"C:\p\install-helper.exe",@"C:\p\Updater.exe"})
+        if(WorkspacePlan.Plan([S(exe,"\""+exe+"\"","9:1")],new HashSet<string>(),new HashSet<string>(),_=>true).Count!=0)throw new Exception("Transient exe must not be relaunched: "+exe);
+    // "Running" is by file name too (versioned update folders).
+    if(WorkspacePlan.Plan([S(@"C:\a\app-1.0\Discord.exe","x","4:1")],new HashSet<string>(StringComparer.OrdinalIgnoreCase){@"C:\a\app-1.1\Discord.exe"},new HashSet<string>(),_=>true).Count!=0)
+        throw new Exception("An app running from a newer versioned folder is not launched again");
+
+    // Strict matching: a transient/unrelated title is not matched; the loose pass only pairs
+    // an exe+class group that is exactly one saved to one live window.
+    var two=new List<SavedWindow>{S(@"C:\c\chrome.exe","","5:1","W","Inbox - Gmail - Google Chrome"),S(@"C:\c\chrome.exe","","5:1","W","Docs - Google Chrome")};
+    var tmp=new List<LiveWindow>{new(21,@"C:\c\chrome.exe","W","New Tab - Google Chrome")};
+    if(WorkspacePlan.Match(two,tmp).Count!=0)throw new Exception("A generic transient title must not be matched");
+    if(WorkspacePlan.Match(two,tmp,loose:true).Count!=0)throw new Exception("The loose pass must not guess between two saved windows");
+    var one=new List<SavedWindow>{S(@"C:\v\code.exe","","6:1","V","plan.md - StayView - Visual Studio Code")};
+    var oneLive=new List<LiveWindow>{new(22,@"C:\v\code.exe","V","Visual Studio Code")};
+    if(WorkspacePlan.Match(one,oneLive).Count!=0||WorkspacePlan.Match(one,oneLive,loose:true).Count!=1)throw new Exception("The loose pass pairs a lone saved window with a lone live one");
+    var close=new List<LiveWindow>{new(23,@"C:\v\code.exe","V","plan.md - StayView - Visual Studio Code ●")};
+    if(WorkspacePlan.Match(one,close).Count!=1)throw new Exception("A near-identical title matches strictly");
+
+    // Session identity: tolerant of small clock corrections; a restored marker stops a
+    // second relaunch in the same sign-in (e.g. after a StayView crash).
+    var k=new SessionKey(1000,7);
+    if(!k.SameSession(new SessionKey(1004,7))||k.SameSession(new SessionKey(1010,7))||k.SameSession(new SessionKey(1000,8)))throw new Exception("Same sign-in within 5 minutes of boot-time drift, same logon only");
+    var file=new WorkspaceFile(new SessionKey(1,1),[S(@"C:\n\n.exe","n","1:1")]);
+    if(!WorkspacePlan.IsFreshSignIn(file,k))throw new Exception("A different sign-in is fresh");
+    if(WorkspacePlan.IsFreshSignIn(file with {RestoredFor=k},new SessionKey(1002,7)))throw new Exception("Once restored for this sign-in, a restart is not fresh again");
+    if(WorkspacePlan.IsFreshSignIn(new WorkspaceFile(k,file.Windows),k))throw new Exception("The same sign-in is not fresh");
+
+    // Malformed but valid JSON loads as nothing saved / drops broken entries, never throws.
+    var bad=Path.Combine(Path.GetTempPath(),"stayview-workspace-bad.json");
+    File.WriteAllText(bad,"{\"Session\":{\"BootMinuteUtc\":1,\"LogonId\":2}}");
+    if(WorkspaceStore.Load(bad)!=null)throw new Exception("A file with no window list loads as nothing saved");
+    File.WriteAllText(bad,"{\"Session\":{\"BootMinuteUtc\":1,\"LogonId\":2},\"Windows\":[{\"Exe\":null},{\"Exe\":\"C:\\\\a.exe\",\"Class\":\"C\",\"Title\":\"T\",\"CommandLine\":\"a\",\"ProcessKey\":\"1:1\"}]}");
+    var partial=WorkspaceStore.Load(bad);
+    if(partial==null||partial.Windows.Count!=1)throw new Exception("Entries with no exe are dropped, valid ones kept");
+    File.Delete(bad);
+    if(ProcessInfo.IsElevated((uint)Environment.ProcessId))Console.WriteLine("NOTE: checks are running elevated; elevation detection not exercised");
+    Console.WriteLine("PASS: final-review fixes (safe arguments, transient exes, strict matching, session tolerance + restored marker, malformed state).");
+}
 // The internal FlyIn opening transition must never be selectable/saved as the user's
 // Desktop transition: the picker offers exactly the five user-facing modes.
 if((int)DesktopTransitionMode.FlyIn!=5||(int)DesktopTransitionMode.Slide!=6||Enum.GetValues<DesktopTransitionMode>().Length!=7)throw new Exception("FlyIn must stay the internal sixth mode, with Slide appended after it");
@@ -210,8 +411,10 @@ Console.WriteLine($"PASS: {checks} legacy grid scenarios plus top/bottom strip r
         throw new Exception("An owned popup of the selected window must keep the browse");
     if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,true,0)!=BrowseTarget.Refront)
         throw new Exception("A completed StayView canvas gesture must re-front the browsed window");
-    if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,false,0)!=BrowseTarget.Grid)
-        throw new Exception("An incidental canvas foreground handoff must not resurrect a closing window");
+    if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,false,0)!=BrowseTarget.Keep)
+        throw new Exception("A fresh canvas foreground handoff must wait: not resurrect a closing window, not drop a live one to the grid");
+    if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,false,0,canvasSettled:true)!=BrowseTarget.Refront)
+        throw new Exception("A canvas that keeps the foreground while the focused window is still here must put that window back in front");
     if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,true,200)!=BrowseTarget.Refront)
         throw new Exception("An explicit canvas gesture must win even if the handle also resolves to a source");
     if(BrowseReconciler.ClassifyForeground(selected,200,200,false,false,200)!=BrowseTarget.Follow)
@@ -250,7 +453,8 @@ foreach (int? hit in new int?[] { null, -2, -1, 0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 1
 }
 if(FocusedClickPolicy.PinBlocksNonClient(1)||FocusedClickPolicy.PinBlocksNonClient(8)||FocusedClickPolicy.PinBlocksNonClient(20)
     ||!FocusedClickPolicy.PinBlocksNonClient(2)||!FocusedClickPolicy.PinBlocksNonClient(9)||!FocusedClickPolicy.PinBlocksNonClient(10)
-    ||!FocusedClickPolicy.PinBlocksNonClient(null,true))
+    ||!FocusedClickPolicy.PinBlocksNonClient(null,true)
+    ||FocusedClickPolicy.PinBlocksNonClient(null,true,true)||FocusedClickPolicy.PinBlocksNonClient(2,false,true))
     throw new Exception("Pinned-window non-client policy must allow content/minimize/close and block move/resize/maximize");
 if (!FocusedClickPolicy.CanShrink(2) || !FocusedClickPolicy.CanDrag(2, false, false)) throw new Exception("Confirmed caption lost its overview gestures");
 if (!FocusedClickPolicy.CanShrink(null, true) || FocusedClickPolicy.CanShrink(1, true)) throw new Exception("Caption timeout fallback must work only when native hit testing is unknown");
@@ -264,27 +468,85 @@ if(!PinnedWindowPolicy.CanPin(true,false,false,false))throw new Exception("Minim
 if(!PinnedWindowPolicy.CanPin(false,true,true,true))throw new Exception("Focused browsed windows must remain pin-eligible");
 if(PinnedWindowPolicy.CanPin(false,false,false,true)||PinnedWindowPolicy.CanPin(false,true,false,true)||PinnedWindowPolicy.CanPin(false,true,true,false))
     throw new Exception("Ordinary windows must still require an active eligible browse target before pinning");
-var pinDesktop=Guid.NewGuid();
-if(!PinnedWindowPolicy.NeedsDesktopMove(false,pinDesktop,Guid.NewGuid())
-    ||!PinnedWindowPolicy.NeedsDesktopMove(false,pinDesktop,Guid.Empty)
-    ||PinnedWindowPolicy.NeedsDesktopMove(true,pinDesktop,Guid.NewGuid())
-    ||PinnedWindowPolicy.NeedsDesktopMove(false,pinDesktop,pinDesktop)
-    ||PinnedWindowPolicy.NeedsDesktopMove(false,Guid.Empty,Guid.NewGuid()))
-    throw new Exception("Pinned windows must follow the active desktop until unpinned");
+var pinHome=Guid.NewGuid();
+if(!PinnedWindowPolicy.NeedsHomeReturn(false,pinHome,Guid.NewGuid())
+    ||PinnedWindowPolicy.NeedsHomeReturn(true,pinHome,Guid.NewGuid())
+    ||PinnedWindowPolicy.NeedsHomeReturn(false,pinHome,pinHome)
+    ||PinnedWindowPolicy.NeedsHomeReturn(false,pinHome,Guid.Empty)
+    ||PinnedWindowPolicy.NeedsHomeReturn(false,Guid.Empty,Guid.NewGuid()))
+    throw new Exception("A pin stays on its home desktop and is only moved back there");
+if(!PinnedWindowPolicy.ParkInFrontPin(false,false)
+    ||PinnedWindowPolicy.ParkInFrontPin(true,false)
+    ||PinnedWindowPolicy.ParkInFrontPin(false,true))
+    throw new Exception("Only an in-front pin is parked as a tile when the desktop changes");
+if(PinnedWindowPolicy.CanFocus(true)||!PinnedWindowPolicy.CanFocus(false)
+    ||PinnedWindowPolicy.CanDragTile(true)||!PinnedWindowPolicy.CanDragTile(false))
+    throw new Exception("A pinned window must not expand on focus or be dragged");
+if(PinnedWindowPolicy.CanPinDocked(true)||!PinnedWindowPolicy.CanPinDocked(false)
+    ||PinnedWindowPolicy.CanDock(true)||!PinnedWindowPolicy.CanDock(false))
+    throw new Exception("A docked window must not be pinned, and a pin must not be docked");
+var normalWindow=new Native.RECT(100,100,1200,800);
+if(!Native.IsMinimizedChrome(new(-32000,-32000,160,28),normalWindow)
+    ||!Native.IsMinimizedChrome(new(40,1000,180,28),normalWindow)
+    ||Native.IsMinimizedChrome(normalWindow,normalWindow)
+    ||Native.IsMinimizedChrome(new(100,100,900,600),normalWindow))
+    throw new Exception("A minimized window frame must not be treated as the window");
 if(DesktopArrangement.Include(true)||!DesktopArrangement.Include(false))
     throw new Exception("Desktop memory must skip pinned windows and keep every other window");
 {
     nint kept=1, changed=2;
     var saved=new Dictionary<nint,DesktopWindowState>
     {
-        [kept]=new(new Native.RECT(0,0,10,10),1,false,false,false,default,false,0),
-        [changed]=new(new Native.RECT(0,0,10,10),1,true,false,true,default,false,1)
+        [kept]=new(new Native.RECT(0,0,10,10),1,false,false,false,0,default,false,0),
+        [changed]=new(new Native.RECT(0,0,10,10),1,true,false,true,1,default,false,1)
     };
     var dock=new List<nint>(); var undock=new List<nint>();
     DesktopArrangement.MembershipEdits(saved,h=>h==kept,dock,undock);
     if(dock.Count!=1||dock[0]!=changed||undock.Count!=1||undock[0]!=kept)
         throw new Exception("Returning to a desktop must restore the dock membership that was remembered");
 }
+// Arriving on a desktop while the overview is up must never really minimize a window
+// remembered as minimized: that played Windows' minimize animation on every switch, the
+// keep-alive then restored it (another animation), and after a few switches the window was
+// flagged as "keeps minimizing itself". Iconic ones are left alone; shown ones are only
+// repositioned (SW_SHOWNOACTIVATE). Maximized stays maximized; everything else is shown.
+foreach(int minimized in new[]{2,6,7})
+{
+    if(DesktopArrangement.RecallShowCmd(minimized,iconicNow:true)!=null)
+        throw new Exception("An iconic window remembered as minimized must be left alone on arrival");
+    if(DesktopArrangement.RecallShowCmd(minimized,iconicNow:false)!=4)
+        throw new Exception("A remembered-minimized window kept alive behind the overview must only be repositioned, never minimized");
+}
+if(DesktopArrangement.RecallShowCmd(3,iconicNow:false)!=3||DesktopArrangement.RecallShowCmd(1,iconicNow:false)!=4)
+    throw new Exception("Maximized windows come back maximized and normal windows are shown without activation");
+// A focused window's stand-in thumbnail is parked over the real window, so its grid home
+// is empty. Hover and press must not answer there: that was the blue ghost outline which,
+// when dragged, moved the focused Chrome window instead of anything visible under it.
+var standInHome=new Native.RECT(1780,490,400,470);
+var standInParked=new Native.RECT(540,600,1350,1330);
+var inStandInHome=new Native.POINT{X=1900,Y=600};
+var inStandInParked=new Native.POINT{X=700,Y=900};
+if(TileHitArea.Contains(standInHome,standInParked,standIn:true,inStandInHome))
+    throw new Exception("A parked stand-in must not be hit at its empty grid home");
+if(!TileHitArea.Contains(standInHome,standInParked,standIn:true,inStandInParked))
+    throw new Exception("A parked stand-in is hit where its thumbnail is drawn");
+if(!TileHitArea.Contains(standInHome,standInParked,standIn:false,inStandInHome)||!TileHitArea.Contains(standInHome,standInParked,standIn:false,inStandInParked))
+    throw new Exception("An ordinary tile is hit at its cell and at its animated position");
+if(!TileHitArea.Contains(standInHome,default,standIn:true,inStandInHome))
+    throw new Exception("A stand-in not yet parked is still hit at its cell");
+// A focused (large) window docks when its drag is released with the CURSOR over the bar:
+// the window itself is kept off the bar. Pins never dock; no bar means no dock.
+var dockBar=new Native.RECT(8,1900,3824,200);
+var onBar=new Native.POINT{X=1800,Y=1950};
+var aboveBar=new Native.POINT{X=1800,Y=1890};
+if(!FocusedDockDrop.ShouldDock(onBar,dockBar,pinned:false,maximized:false))
+    throw new Exception("Releasing a focused window's drag over the bar docks it");
+if(FocusedDockDrop.ShouldDock(aboveBar,dockBar,pinned:false,maximized:false))
+    throw new Exception("A focused window released off the bar is only moved");
+if(FocusedDockDrop.ShouldDock(onBar,dockBar,pinned:true,maximized:false)||FocusedDockDrop.ShouldDock(onBar,dockBar,pinned:false,maximized:true))
+    throw new Exception("Pinned and maximized windows never dock from a drag");
+if(FocusedDockDrop.ShouldDock(onBar,default,pinned:false,maximized:false))
+    throw new Exception("No visible bar, no dock");
 var lockedPin=new Native.RECT(10,20,300,200);
 if(!PinnedWindowPolicy.IsSettledAdjustment(lockedPin,lockedPin)
     ||!PinnedWindowPolicy.IsSettledAdjustment(new Native.RECT(18,12,308,192),lockedPin)
@@ -419,6 +681,10 @@ Console.WriteLine("PASS: popout drops map negative-coordinate monitors and prese
     var pinnedSet=new HashSet<nint>{2};
     var withPin=TileRepulsion.Resolve(99,draggedRect,home,pinnedSet,canvas,G,V,H);
     if(!withPin[2].Equals(home[2]))throw new Exception("Repel moved a pinned tile");
+    var yielded=TileRepulsion.YieldToFixed(draggedRect,new[]{home[2]},canvas,G,V,H);
+    if(yielded.Equals(draggedRect)||TileRepulsion.TooClose(yielded,home[2],G,V,H))throw new Exception("A pinned tile did not push the dragged tile aside");
+    var clear=TileRepulsion.YieldToFixed(new(1500,300,120,80),new[]{home[2]},canvas,G,V,H);
+    if(!clear.Equals(new Native.RECT(1500,300,120,80)))throw new Exception("A pin pushed a tile that was not touching it");
     // Solving from home each frame: moving away restores home positions.
     var back=TileRepulsion.Resolve(99,new(1500,300,120,80),home,new HashSet<nint>(),canvas,G,V,H);
     if(home.Any(p=>!back[p.Key].Equals(p.Value)))throw new Exception("Neighbours did not return home once the dragged tile left");

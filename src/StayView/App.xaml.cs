@@ -8,13 +8,15 @@ public partial class App:Application
     public App(){InitializeComponent();UnhandledException+=(_,e)=>{Log.Write(e.Exception.ToString());tray?.Stop();};AppDomain.CurrentDomain.ProcessExit+=(_,_)=>tray?.EmergencyRestore();}
     protected override void OnLaunched(LaunchActivatedEventArgs args){
         var argv=Environment.GetCommandLineArgs();
-        if(argv.Length>2&&argv[1]=="--desktop-broker"){DesktopBroker.Run(argv[2]);Exit();return;}
+        // Helper modes end the process outright. WinUI's Exit() is a request that a thread
+        // stuck in COM/UIA can outlive, leaving an orphaned helper.
+        if(argv.Length>2&&argv[1]=="--desktop-broker"){DesktopBroker.Run(argv[2]);Environment.Exit(0);return;}
         if(argv.Length>2&&argv[1]=="--empty-space-probe"){EmptySpaceProbeServer.Run(argv[2]);Exit();return;}
         if(argv.Length>2&&argv[1]=="--guardian"){
             try{var parent=Process.GetProcessById(int.Parse(argv[2]));parent.WaitForExit();}catch{}
             using var gate=new Mutex(false,"Local\\StayView.Singleton");
             bool acquired=false;try{try{acquired=gate.WaitOne(1000);}catch(AbandonedMutexException){acquired=true;}if(acquired)PlacementStore.Recover();}finally{if(acquired)gate.ReleaseMutex();}
-            Exit();return;
+            Environment.Exit(0);return;
         }
         mutex=new Mutex(true,"Local\\StayView.Singleton",out bool first);if(!first){Exit();return;}
         // Launch splash first; the (synchronous) load continues once it has painted.
@@ -52,6 +54,17 @@ public partial class App:Application
             }
         };
         startup.Start();
+    }
+    // Quit the UI process. Exit() asks WinUI to shut down; a window, timer or foreground
+    // thread that keeps the process alive would leave it running in the background with no
+    // tray icon. A background backstop ends it for certain. Helpers in the kill-on-close job
+    // die with it; the guardian was already stopped by ShutdownHelpers.
+    internal void Quit()
+    {
+        Log.Write("[exit] quitting");
+        var backstop=new Thread(()=>{Thread.Sleep(4000);Log.Write("[exit] still running 4 s after Exit; forcing process end");Environment.Exit(0);}){IsBackground=true,Name="Exit backstop"};
+        backstop.Start();
+        Exit();
     }
     static void FadeSplash(SplashWindow splash){try{splash.FadeOut();}catch(Exception ex){Log.Write("Splash fade failed: "+ex.Message);}}
     internal void ShutdownHelpers()

@@ -68,23 +68,35 @@ static class GlassAppearance
     static Color Scale(Color c,double k,byte alpha)=>Color.FromArgb(alpha,(byte)Math.Round(c.R*k),(byte)Math.Round(c.G*k),(byte)Math.Round(c.B*k));
     public static Brush StripBrush(Settings settings)
     {
-        // The desktop strip is the same tint family as the page but a shade darker, so it
-        // reads as a bar rather than a lighter grey block, with a left-to-right shading
-        // (slightly lighter on the left, darkest on the right). Sits over the acrylic
-        // backdrop, so partial alpha reads as frosted; opaque when transparency is off.
-        byte alpha=TransparencyEnabled&&!settings.ReduceBlur?Alpha(Math.Min(100,EffectiveStripOpacity(settings)+20)):(byte)255;
+        // Frosted glass: the theme's tint at about 45% (the blurred wallpaper under the
+        // window's acrylic shows through), lifted by a faint white frost (about 8%), with the
+        // same left-to-right shading as before. Opaque when transparency is off.
+        bool glass=TransparencyEnabled&&!settings.ReduceBlur;
+        byte alpha=glass?Alpha(StripGlassPercent):(byte)255;
         var (start,end)=ThemeColors(settings,alpha);
         return new LinearGradientBrush {
             StartPoint=new Windows.Foundation.Point(0,0),EndPoint=new Windows.Foundation.Point(1,0),
             GradientStops={
-                new GradientStop{Offset=0,Color=Scale(start,0.75,alpha)},
-                new GradientStop{Offset=1,Color=Scale(end,0.55,alpha)}
+                new GradientStop{Offset=0,Color=Frost(Scale(start,0.75,alpha),glass?StripFrost:0)},
+                new GradientStop{Offset=1,Color=Frost(Scale(end,0.55,alpha),glass?StripFrost:0)}
             }
         };
     }
-    // No visible outline around the desktop/dock bar at rest; the bar reads by its glass
-    // fill alone. The blue ActiveBrush still marks it as a drop target on dock hover.
-    public static SolidColorBrush StripEdgeBrush()=>new(Color.FromArgb(0,255,255,255));
+    public const int StripGlassPercent=45;
+    const double StripFrost=0.08;
+    // Mix a fraction of white into a colour (keeps its alpha): the frost of the glass.
+    static Color Frost(Color c,double white)=>Color.FromArgb(c.A,
+        (byte)Math.Round(c.R+(255-c.R)*white),(byte)Math.Round(c.G+(255-c.G)*white),(byte)Math.Round(c.B+(255-c.B)*white));
+    // The glass edge: a light 1 px rim, brightest along the top (catching the light) and
+    // fading down the sides. The blue ActiveBrush still replaces it on dock hover.
+    public static Brush StripEdgeBrush()=>new LinearGradientBrush {
+        StartPoint=new Windows.Foundation.Point(0,0),EndPoint=new Windows.Foundation.Point(0,1),
+        GradientStops={
+            new GradientStop{Offset=0,Color=Color.FromArgb(72,255,255,255)},
+            new GradientStop{Offset=0.35,Color=Color.FromArgb(22,255,255,255)},
+            new GradientStop{Offset=1,Color=Color.FromArgb(14,255,255,255)}
+        }
+    };
     public static SolidColorBrush SurfaceBrush(int percent)=>new(Color.FromArgb(Alpha(percent),Tint.R,Tint.G,Tint.B));
     public static SolidColorBrush SurfaceBrush2(int percent)=>new(Color.FromArgb(Alpha(percent),Tint2.R,Tint2.G,Tint2.B));
     public static SolidColorBrush EdgeBrush()=>new(Edge);
@@ -97,11 +109,11 @@ static class GlassAppearance
     public static SolidColorBrush ButtonBlueActiveBrush()=>new(ButtonBlueActive);
     public static SolidColorBrush MenuGreyBrush()=>new(MenuGrey);
     public static SolidColorBrush MenuWhiteBrush()=>new(Microsoft.UI.Colors.White);
-    // Slightly-transparent panel background (Options window). Sits over the acrylic
-    // backdrop so it reads as frosted; opaque fallback when transparency is disabled.
+    // Half-transparent panel background (Options window): 50% tint over the acrylic
+    // backdrop, so the blurred desktop shows through; opaque when transparency is disabled.
     public static Brush PanelBrush(Settings settings)
     {
-        byte alpha=TransparencyEnabled&&!settings.ReduceBlur?(byte)205:(byte)255;
+        byte alpha=TransparencyEnabled&&!settings.ReduceBlur?(byte)128:(byte)255;
         return new LinearGradientBrush {
             StartPoint=new Windows.Foundation.Point(0,0),EndPoint=new Windows.Foundation.Point(1,1),
             GradientStops={
@@ -109,6 +121,34 @@ static class GlassAppearance
                 new GradientStop{Offset=1,Color=Color.FromArgb(alpha,1,4,10)}
             }
         };
+    }
+
+    // Pin head: a glossy sphere lit from the top-left, like a push-pin seen from above.
+    // Layers: contact shadow, shaded body, dark rim, bottom rim light, specular highlight.
+    public const double PinHeadSize=20;
+    public static UIElement PinHead()
+    {
+        const double s=PinHeadSize;
+        static Windows.Foundation.Point P(double x,double y)=>new(x,y);
+        static GradientStop Stop(double o,byte a,byte r,byte g,byte b)=>new(){Offset=o,Color=Color.FromArgb(a,r,g,b)};
+        var shadow=new Microsoft.UI.Xaml.Shapes.Ellipse{Width=s,Height=s,
+            Fill=new RadialGradientBrush{Center=P(.5,.5),GradientOrigin=P(.5,.5),RadiusX=.5,RadiusY=.5,
+                GradientStops={Stop(0,150,0,4,12),Stop(.6,90,0,4,12),Stop(1,0,0,4,12)}},
+            RenderTransform=new TranslateTransform{X=1.5,Y=2.5}};
+        var body=new Microsoft.UI.Xaml.Shapes.Ellipse{Width=s,Height=s,
+            Fill=new RadialGradientBrush{Center=P(.42,.38),GradientOrigin=P(.34,.28),RadiusX=.7,RadiusY=.7,
+                GradientStops={Stop(0,255,196,232,255),Stop(.28,255,96,178,255),Stop(.62,255,30,104,208),Stop(.9,255,10,44,104),Stop(1,255,6,26,64)}},
+            Stroke=new SolidColorBrush(Color.FromArgb(230,4,16,40)),StrokeThickness=1};
+        // Light bouncing off the canvas onto the lower edge; gives the sphere its underside.
+        var rimLight=new Microsoft.UI.Xaml.Shapes.Ellipse{Width=s-2,Height=s-2,Margin=new Thickness(1),
+            Fill=new RadialGradientBrush{Center=P(.5,.5),GradientOrigin=P(.62,.78),RadiusX=.5,RadiusY=.5,
+                GradientStops={Stop(0,0,110,220,255),Stop(.78,0,110,220,255),Stop(1,120,110,220,255)}}};
+        var specular=new Microsoft.UI.Xaml.Shapes.Ellipse{Width=s*.42,Height=s*.28,
+            HorizontalAlignment=HorizontalAlignment.Left,VerticalAlignment=VerticalAlignment.Top,
+            Margin=new Thickness(s*.2,s*.13,0,0),
+            Fill=new RadialGradientBrush{Center=P(.5,.5),GradientOrigin=P(.45,.4),RadiusX=.5,RadiusY=.5,
+                GradientStops={Stop(0,235,255,255,255),Stop(.55,110,255,255,255),Stop(1,0,255,255,255)}}};
+        return new Grid{Width=s,Height=s,IsHitTestVisible=false,Children={shadow,body,rimLight,specular}};
     }
 
     public static void ApplyBackdrop(Window window,Settings settings)

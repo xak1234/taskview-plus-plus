@@ -9,6 +9,26 @@ internal sealed class DirectVirtualDesktopService
     public string Status {get;private set;}="Desktop controls unavailable on this Windows build; current-desktop tiling remains available.";
     public DirectVirtualDesktopService() {
         try {standard=(IVirtualDesktopManager)Activator.CreateInstance(Type.GetTypeFromCLSID(new("AA509086-5CA9-4C25-8F95-589D3C07B48A"))!)!;}catch{}
+        Connect();
+    }
+    long reconnectAfter,reconnectDelay=1000;
+    // Explorer restarts, and a single failed call during a shell animation, used to turn
+    // desktop support off for the life of the broker. Reconnect instead, backing off from
+    // 1 s to 30 s while it keeps failing.
+    bool EnsureManager()
+    {
+        if(manager!=null)return true;
+        long now=Environment.TickCount64;
+        if(now<reconnectAfter)return false;
+        Connect(); // a failed connect backs off through Disable
+        return manager!=null;
+    }
+    void BackOff()
+    {
+        reconnectAfter=Environment.TickCount64+reconnectDelay;
+        reconnectDelay=Math.Min(30000,reconnectDelay*2);
+    }
+    void Connect() {
         // This ABI is deliberately gated. Unknown builds use the documented current-desktop API.
         if(Environment.OSVersion.Version.Build is <26100 or >26200)return;
         try {
@@ -27,13 +47,17 @@ internal sealed class DirectVirtualDesktopService
         try {var buffer=WindowsGetStringRawBuffer(value,out var length);return Marshal.PtrToStringUni(buffer,(int)length)??"";}
         finally {WindowsDeleteString(value);}
     }
-    void Disable(Exception ex){manager=null;views=null;Log.Write("Private desktop API: "+ex.Message);}
+    // A connect can succeed while calls keep failing (Explorer busy, RPC_E_CALL_REJECTED):
+    // back off here too, or every broker call reconnects and logs. Only a call that
+    // actually succeeds resets the delay (see Current).
+    void Disable(Exception ex){manager=null;views=null;pinned=null;BackOff();Log.Write("Private desktop API (will reconnect): "+ex.Message);}
     public bool IsCurrent(nint h){try{return standard?.IsWindowOnCurrentVirtualDesktop(h)??true;}catch{return true;}}
     public Guid WindowDesktop(nint h){try{return standard?.GetWindowDesktopId(h)??Guid.Empty;}catch{return Guid.Empty;}}
-    public Guid Current {get{try{return manager?.GetCurrentDesktop().GetId()??Guid.Empty;}catch(Exception ex){Disable(ex);return Guid.Empty;}}}
+    public Guid Current {get{if(!EnsureManager())return Guid.Empty;try{var id=manager!.GetCurrentDesktop().GetId();reconnectDelay=1000;return id;}catch(Exception ex){Disable(ex);return Guid.Empty;}}}
     public IReadOnlyList<DesktopInfo> List() {
         try{
-            if(manager==null)return [];var current=Current;
+            if(!EnsureManager())return [];var current=Current;
+            if(manager==null)return [];
             manager.GetDesktops(out var array);array.GetCount(out var count);
             var result=new List<DesktopInfo>();var iid=typeof(IDesktop).GUID;
             try{for(int i=0;i<count;i++){array.GetAt(i,ref iid,out var obj);var d=(IDesktop)obj;var id=d.GetId();string name=RegistryName(id);if(string.IsNullOrWhiteSpace(name))try{name=ReadHString(d.GetName());}catch{name="";}if(string.IsNullOrWhiteSpace(name))name="Desktop "+(i+1);string wallpaper;try{wallpaper=ReadHString(d.GetWallpaperPath());}catch{wallpaper="";}result.Add(new(id,name,id==current,wallpaper));Marshal.ReleaseComObject(d);}}finally{Marshal.ReleaseComObject(array);}
@@ -46,17 +70,17 @@ internal sealed class DirectVirtualDesktopService
     public bool MoveDesktop(Guid id,int index)=>Do(()=>manager!.MoveDesktop(manager.FindDesktop(ref id),index));
     public bool Move(nint h,Guid id)=>Do(()=>{views!.GetViewForHwnd(h,out var view);try{manager!.MoveViewToDesktop(view,manager.FindDesktop(ref id));}finally{Marshal.ReleaseComObject(view);}});
     public bool Pin(nint h) {
-        if(pinned==null||views==null)return false;
+        if(!EnsureManager()||pinned==null||views==null)return false;
         try { if(views.GetViewForHwnd(h,out var view)!=0)return false;try{if(!pinned.IsViewPinned(view))pinned.PinView(view);return true;}finally{Marshal.ReleaseComObject(view);} }
         catch(Exception ex){Log.Write("Pin window: "+ex.Message);return false;}
     }
     public bool IsPinned(nint h) {
-        if(pinned==null||views==null)return false;
+        if(!EnsureManager()||pinned==null||views==null)return false;
         try { if(views.GetViewForHwnd(h,out var view)!=0)return false;try{return pinned.IsViewPinned(view);}finally{Marshal.ReleaseComObject(view);} }
         catch(Exception ex){Log.Write("Read window pin: "+ex.Message);return false;}
     }
     public bool Unpin(nint h) {
-        if(pinned==null||views==null)return false;
+        if(!EnsureManager()||pinned==null||views==null)return false;
         try { if(views.GetViewForHwnd(h,out var view)!=0)return false;try{if(pinned.IsViewPinned(view))pinned.UnpinView(view);return true;}finally{Marshal.ReleaseComObject(view);} }
         catch(Exception ex){Log.Write("Unpin window: "+ex.Message);return false;}
     }
@@ -66,7 +90,7 @@ internal sealed class DirectVirtualDesktopService
         try{return Registry.GetValue($@"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops\Desktops\{{{id}}}","Name","") as string??"";}
         catch{return "";}
     }
-    bool Do(Action action){if(manager==null)return false;try{action();return true;}catch(Exception ex){Log.Write("Desktop operation: "+ex.Message);return false;}}
+    bool Do(Action action){if(!EnsureManager())return false;try{action();return true;}catch(Exception ex){Log.Write("Desktop operation: "+ex.Message);return false;}}
 }
 [ComImport,Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IVirtualDesktopManager {bool IsWindowOnCurrentVirtualDesktop(nint h);Guid GetWindowDesktopId(nint h);void MoveWindowToDesktop(nint h,ref Guid id);}

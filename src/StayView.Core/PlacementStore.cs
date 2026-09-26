@@ -41,27 +41,37 @@ public sealed class PlacementStore
     public void Persist() {Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(journal))!);File.WriteAllText(journal+".tmp",JsonSerializer.Serialize(saved.Values,json));File.Move(journal+".tmp",journal,true);}
     // A window the user deliberately dragged keeps where they put it: refresh its journal
     // entry (same z-order and desktop) so dismissal restores the new spot, not the old one.
-    public void Recapture(nint h) {
+    // dx/dy is how far StayView itself has moved the window for the overview (centre over
+    // tile, off the desktop bar, clear of a pin). That part is presentation, not the
+    // user's placement, so it is taken back out of what is journaled.
+    public void Recapture(nint h,int dx=0,int dy=0) {
         if(!saved.TryGetValue(h,out var old))return;
         // Never remove the known-good journal entry until a complete replacement exists.
         // A transient process/window race must not turn a recapture failure into lost
         // restore state for the rest of the session.
         if(!TrySnapshot(h,old.Z,old.DesktopId,out var replacement))return;
+        if(dx!=0||dy!=0)
+        {
+            replacement.Bounds=Offset(replacement.Bounds,-dx,-dy);
+            var p=replacement.Placement;p.NormalPosition=Offset(p.NormalPosition,-dx,-dy);replacement.Placement=p;
+        }
         saved[h]=replacement;
         Persist();
     }
+    static Native.RECT Offset(Native.RECT r,int dx,int dy)=>new(r.Left+dx,r.Top+dy,r.Width,r.Height);
     // Update only geometry after StayView makes a safety correction (for example moving a
     // title bar back below the top of the work area). Preserve the original show state,
     // z-order/topmost intent and desktop metadata rather than recapturing temporary overview
     // state such as HWND_BOTTOM.
-    public void UpdateGeometry(nint h)
+    public void UpdateGeometry(nint h,int dx=0,int dy=0)
     {
         if(!saved.TryGetValue(h,out var entry) || Native.IsIconic(h) || !Native.GetWindowRect(h,out var bounds))return;
         var current=Native.Placement(h);
         var p=entry.Placement;
-        p.NormalPosition=current.NormalPosition;
+        // dx/dy: StayView's own presentation moves, taken back out (see Recapture).
+        p.NormalPosition=Offset(current.NormalPosition,-dx,-dy);
         entry.Placement=p;
-        entry.Bounds=bounds;
+        entry.Bounds=Offset(bounds,-dx,-dy);
         entry.Monitor=Native.MonitorFromWindow(h,2);
         entry.Dpi=Native.GetDpiForWindow(h);
         Persist();
@@ -119,7 +129,11 @@ public sealed class PlacementStore
     }
     public static bool RestoreOne(SavedPlacement s,VirtualDesktopService? desktops=null) {
         if(!SameWindow(s))return true;
-        var h=(nint)s.Handle;var p=s.Placement;p.Length=System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>();
+        var h=(nint)s.Handle;
+        // The app hid this window itself during the session (closed to the tray, for
+        // example). SetWindowPlacement with any show command would bring it back.
+        if(!Native.IsWindowVisible(h))return true;
+        var p=s.Placement;p.Length=System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>();
         int show=p.ShowCmd;
         if(show==1)p.ShowCmd=4; // Restore geometry without activating another desktop.
         else if(show is 2 or 6 or 7)p.ShowCmd=7;

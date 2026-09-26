@@ -9,7 +9,8 @@ namespace StayView.Core;
 // Only tiles the drag actually reaches move: a tile is pushed when it is too close to the
 // dragged tile or to a tile that has already been pushed, so a push cascades outward
 // (A pushes B pushes C) while tiles the user left close together elsewhere stay put.
-// The dragged tile and pinned tiles never move.
+// Pinned tiles never move. They still repel: the dragged tile is pushed out of
+// them, and every other tile has to clear them too.
 //
 // The solve always starts from the tiles' home positions, never from the previous frame,
 // so neighbours slide back as the dragged tile moves away and repeated frames cannot drift.
@@ -17,6 +18,28 @@ namespace StayView.Core;
 // a neighbour does not swing across when the pointer wobbles over its centre.
 public static class TileRepulsion
 {
+    // Push `dragged` out of every fixed footprint. The fixed rects themselves are not
+    // changed: a pinned window keeps its place and still repels whatever is dragged into it.
+    public static Native.RECT YieldToFixed(Native.RECT dragged, IEnumerable<Native.RECT> fixedRects,
+        Native.RECT canvas, int horizontalGap, int verticalGap, int header)
+    {
+        var obstacles = fixedRects.Where(r => r.Width > 0 && r.Height > 0).ToList();
+        if (obstacles.Count == 0) return dragged;
+        var yielded = dragged;
+        for (int pass = 0; pass < obstacles.Count; pass++)
+        {
+            bool hit = false;
+            foreach (var pin in obstacles)
+            {
+                if (!TooClose(yielded, pin, horizontalGap, verticalGap, header)) continue;
+                hit = true;
+                yielded = PushClear(yielded, pin, obstacles, canvas, horizontalGap, verticalGap, header, default);
+            }
+            if (!hit) break;
+        }
+        return yielded;
+    }
+
     public static Dictionary<nint, Native.RECT> Resolve(
         nint dragged, Native.RECT draggedRect,
         IReadOnlyDictionary<nint, Native.RECT> home, IReadOnlySet<nint> fixedTiles,

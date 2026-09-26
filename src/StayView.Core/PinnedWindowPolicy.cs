@@ -2,17 +2,34 @@ namespace StayView.Core;
 
 public static class PinnedWindowPolicy
 {
-    // Minimized/docked tiles are explicit workspace objects, so they can be pinned without
-    // first restoring/focusing the real HWND. Normal windows remain pin-eligible only while
-    // they are the active browse target.
+    // Minimized canvas tiles can be pinned without first restoring/focusing the real HWND.
+    // Normal windows remain pin-eligible only while they are the active browse target.
     public static bool CanPin(bool minimized, bool browsing, bool browsed, bool browseEligible) =>
         minimized || (browsing && browsed && browseEligible);
 
-    // A live native view pin already spans every desktop and must not be moved: Windows
-    // clears that pin when its owning desktop is changed. If the native pin is unavailable
-    // or was lost, StayView follows the active desktop itself until the user unpins.
-    public static bool NeedsDesktopMove(bool nativePinActive, Guid current, Guid owner) =>
-        !nativePinActive && current != Guid.Empty && (owner == Guid.Empty || owner != current);
+    // Pin and dock exclude each other. A docked window cannot be pinned (it would need
+    // unpinning before it could leave the dock), and a pin is never docked.
+    public static bool CanPinDocked(bool docked) => !docked;
+    public static bool CanDock(bool pinned) => !pinned;
+
+    // A StayView pin belongs to the desktop it was pinned on. Creating or switching
+    // desktops must not adopt it: moving it makes that window look like a member of
+    // whichever desktop is on screen. A live native view pin already spans every
+    // desktop and must not be moved either — Windows clears that pin when its
+    // owning desktop changes. If a window was carried off its home desktop, send
+    // it back. An unknown owner is left alone.
+    public static bool NeedsHomeReturn(bool nativePinActive, Guid home, Guid owner) =>
+        !nativePinActive && home != Guid.Empty && owner != Guid.Empty && owner != home;
+
+    // Changing desktop raises the overview and drops the browse. An in-front pin
+    // left HWND_TOPMOST then sits under that overview: its corner marker is lost
+    // and every later focus fight blanks the thumbnail. Park it as a tile pin.
+    // A tile pin, and a minimized pin, stay as they are.
+    public static bool ParkInFrontPin(bool tileOnly, bool minimized) => !tileOnly && !minimized;
+
+    // A pin freezes the window. Focusing it must not expand it, and its tile must not move.
+    public static bool CanFocus(bool pinned) => !pinned;
+    public static bool CanDragTile(bool pinned) => !pinned;
 
     // Chromium, Electron and DWM invisible borders settle a few pixels off the rect we
     // requested. Treating that as a violation and calling SetWindowPos on every tick
