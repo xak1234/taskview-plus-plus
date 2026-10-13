@@ -57,6 +57,7 @@ public sealed class OverviewSession : IDisposable
     // Null when the overview is closed or the window's geometry is unknown.
     public Func<Native.RECT,Native.RECT>? StripClamp(nint h)
     {
+        if(settings.NativeWindowControls)return null;
         if(!Active || h==0 || !Native.GetWindowRect(h,out var current) || !Native.TryGetVisualBounds(h,out var visual))return null;
         int leftMargin=visual.Left-current.Left,topMargin=visual.Top-current.Top,width=visual.Width,height=visual.Height;
         return rect=>{
@@ -408,7 +409,7 @@ public sealed class OverviewSession : IDisposable
             Reflow();
             if(currentCells.TryGetValue(h,out var snapped))final=snapped;
         }
-        if(!Active)return;
+        if(!Active || settings.NativeWindowControls)return;
         int dx=final.Left-original.Left,dy=final.Top-original.Top;
         // Only the tile the user actually dragged changes its real desktop placement.
         // Any neighbour moved automatically by Auto Arrange keeps its existing HWND spot.
@@ -490,13 +491,18 @@ public sealed class OverviewSession : IDisposable
     // The Task-View action: bring the real window to the front at its true size and
     // focus it. The overlay's own topmost state is dropped by the caller (OverlayChrome
     // / TrayApp) so this window can actually sit in front of the acrylic.
-    public bool Activate(nint h)
+    public bool Activate(nint h, bool requestForeground = true, bool restoreDocked = false)
     {
         if (!Active || !Native.IsWindow(h)) return false;
+        // A foreground notification is not a user request to undock. Shell
+        // desktop switching and passive thumbnail restoration can both focus
+        // a dock source. Only a tile/taskbar restore may clear its state.
+        if(!WindowActivationPolicy.CanActivate(docked.Contains(h),
+            minimizedDocked.Contains(h),userMinimized.Contains(h),requestForeground,restoreDocked))return false;
         var current=Desktops.Current;
         var owner=Desktops.WindowDesktop(h);
         if(!IsPinned(h)&&(current!=Guid.Empty && owner!=Guid.Empty ? owner!=current : !Desktops.IsCurrent(h)))return false;
-        PrepareActivationGeometry(h);
+        if(requestForeground)PrepareActivationGeometry(h);
         bool userIsRestoring = Placements.Entries.TryGetValue(h, out var savedBefore)
             && savedBefore.Placement.ShowCmd is 2 or 6 or 7;
         // A minimized source restores to ITS saved normal rectangle, not a canvas rect.
@@ -507,23 +513,27 @@ public sealed class OverviewSession : IDisposable
         // passive overview-thumbnail keepalive path must continue using no-activate restore.
         if (Native.IsIconic(h))
         {
+            if(!requestForeground)return false;
             if(Native.SendMessageTimeout(h,0x112,(nint)0xF120,0,0x2,120,out _)==0)
                 Native.PostMessage(h, 0x112, (nint)0xF120, 0);
             Native.ShowWindowAsync(h, 9);
             if(Native.IsIconic(h))return false;
         }
         // The first geometry pass may have run while the HWND was still iconic.
-        PrepareActivationGeometry(h);
+        if(requestForeground)PrepareActivationGeometry(h);
         // Restore/placement APIs can legally produce a frame whose caption sits above the
         // current work area (stale monitor topology, workspace offsets, or app self-moves).
         // Correct it before foreground handoff so the focused title bar never appears offscreen.
-        EnsureActivationTopVisible(h);
+        if(requestForeground)EnsureActivationTopVisible(h);
         // Lift off the bottom of the z-order (overview keeps sources lowered) and focus.
         // A denied z-order request (e.g. an elevated console) must not prevent the
         // independent foreground request. Cross-thread activation completes asynchronously;
         // the UI caller retries while keeping the overview out of the way.
-        Native.SetWindowPos(h, 0, 0, 0, 0, 0, 0x13 | 0x4000);
-        Native.ForceForeground(h);
+        if(requestForeground)
+        {
+            Native.SetWindowPos(h, 0, 0, 0, 0, 0, 0x13 | 0x4000);
+            Native.SetForegroundWindow(h);
+        }
         var focused = Native.GetForegroundWindow();
         // Success requires the window to be BOTH the foreground AND actually restored.
         // ShowWindowAsync only POSTS the restore, so on an early attempt a just-minimized
@@ -543,10 +553,14 @@ public sealed class OverviewSession : IDisposable
             RecaptureUserPlacement(h);
             tileMoved.Remove(h);
             minimizedOnEntry.Remove(h);
-            docked.Remove(h);
         }
-        userMinimized.Remove(h);
-        minimizedDocked.Remove(h);
+        if(requestForeground || restoreDocked)
+        {
+            if(docked.Remove(h))Log.Write($"[dock] explicit activation released {h}");
+            minimizedOnEntry.Remove(h);
+            userMinimized.Remove(h);
+            minimizedDocked.Remove(h);
+        }
         Selected = h;
         return true;
     }
@@ -585,6 +599,7 @@ public sealed class OverviewSession : IDisposable
     // where it was, unless the user moves it themselves (NoteUserMoved recaptures).
     public bool CenterOverTile(nint h)
     {
+        if(settings.NativeWindowControls)return false;
         // A tile the user dragged already carries their chosen placement for this window
         // (PrepareActivationGeometry applies it, and Activate applies it again): centring
         // would expand to one spot and then jump to the other.
@@ -606,6 +621,7 @@ public sealed class OverviewSession : IDisposable
         if(!Active || h==0 || !Native.GetWindowRect(h,out var current))return false;
         int dx=left-current.Left,dy=top-current.Top;
         if(dx==0&&dy==0)return false;
+        FocusedWindowGeometry.LogIfCaptionHidden(h,new Native.RECT(left,top,current.Width,current.Height),"overview presentation");
         if(!Native.SetWindowPos(h,0,left,top,0,0,0x15))return false; // NOSIZE|NOZORDER|NOACTIVATE
         var offset=presentationOffset.GetValueOrDefault(h);
         presentationOffset[h]=(offset.X+dx,offset.Y+dy);
@@ -633,6 +649,7 @@ public sealed class OverviewSession : IDisposable
     // Must match what EnsureActivationTopVisible does to the real window.
     public Native.RECT FocusTarget(nint monitor, Native.RECT visual)
     {
+        if(settings.NativeWindowControls)return visual;
         var work=Native.WorkArea(monitor);
         var fitted=FocusedWindowGeometry.FitInside(visual,work);
         return FocusedWindowGeometry.MoveOffBar(fitted,0,0,fitted.Width,fitted.Height,StripBar(monitor),work);
@@ -649,14 +666,19 @@ public sealed class OverviewSession : IDisposable
         var work=Native.WorkArea(monitor);
         bool changed=false;
         // A frame outside the work area is a real placement fault: fix it and journal it.
-        var corrected=FocusedWindowGeometry.FitWindowInside(windowBounds,visualBounds,work);
+        // Native controls fix only a title bar above the work area, without resizing.
+        var corrected=settings.NativeWindowControls
+            ?FocusedWindowGeometry.KeepCaptionVisible(windowBounds,visualBounds,work)
+            :FocusedWindowGeometry.FitWindowInside(windowBounds,visualBounds,work);
         if(!corrected.Equals(windowBounds))
         {
+            Log.Write($"[geometry] {h} '{Native.Title(h)}' frame {visualBounds.Left},{visualBounds.Top},{visualBounds.Width},{visualBounds.Height} outside work {work.Left},{work.Top},{work.Width},{work.Height}; moved to {corrected.Left},{corrected.Top}");
             if(!Native.SetWindowPos(h,0,corrected.Left,corrected.Top,corrected.Width,corrected.Height,0x14))return false; // NOZORDER|NOACTIVATE
             var offset=presentationOffset.GetValueOrDefault(h);
             Placements.UpdateGeometry(h,offset.X,offset.Y);
             changed=true;
         }
+        if(settings.NativeWindowControls)return changed;
         // The desktop bar only exists while the overview is up. Slide the frame off it
         // without resizing, as presentation only, so dismissal restores the user's spot.
         var visible=FocusedWindowGeometry.FitInside(visualBounds,work);

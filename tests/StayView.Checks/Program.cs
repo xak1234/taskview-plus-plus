@@ -1,6 +1,7 @@
 using StayView.Core;
 using System.Text.Json;
 Fixtures.SetProcessDpiAwarenessContext(-4);
+if(args.Length>0&&args[0]=="dock-activation-review"){await Fixtures.CheckPassiveDockActivation();return;}
 var options=new JsonSerializerOptions{IncludeFields=true,WriteIndented=true};
 if(args.Length>0&&args[0]=="stayview-windows"){
     int z=0;
@@ -15,6 +16,9 @@ if(args.Length>0&&args[0]=="stayview-windows"){
 }
 if(args.Length>0&&args[0]=="fixtures"){Fixtures.Run();return;}
 if(args.Length>0&&args[0]=="interaction-checks"){await InteractionChecks.Run();return;}
+if(args.Length>0&&args[0]=="desktop-grid-checks"){await InteractionChecks.Run(nativeOnly:true,desktopOnly:true,gridOnly:true);return;}
+if(args.Length>0&&args[0]=="desktop-focus-checks"){await InteractionChecks.Run(nativeOnly:true,desktopOnly:true);return;}
+if(args.Length>0&&args[0]=="native-interaction-checks"){await InteractionChecks.Run(nativeOnly:true);return;}
 if(args.Length>0&&args[0]=="empty-space-checks"){await Fixtures.CheckEmptySpace();return;}
 if(args.Length>0&&args[0]=="window-geometry-checks"){await Fixtures.CheckWindowGeometry();return;}
 if(args.Length>0&&args[0]=="pin-hold-checks"){await Fixtures.CheckPinHold();return;}
@@ -81,7 +85,30 @@ if(args.Length>0){
     }else foreach(var s in state)Console.WriteLine(JsonSerializer.Serialize(s,options));
     catalog.Dispose();return;
 }
+ReviewPolicyChecks.Run();
 int checks=0;
+{
+    var desktop=Guid.NewGuid();
+    var request=new FocusRequest(7,12,desktop);
+    if(!request.IsCurrent(7,12,desktop,true)
+        || request.IsCurrent(7,13,desktop,true)
+        || request.IsCurrent(8,12,desktop,true)
+        || request.IsCurrent(7,12,Guid.NewGuid(),true)
+        || request.IsCurrent(7,12,desktop,false))
+        throw new Exception("A delayed focus must yield to newer input, a newer request, a desktop switch or dismissal");
+    var start=new Native.RECT(0,0,200,100);
+    var oldTarget=new Native.RECT(500,0,200,100);
+    var displayed=new Native.RECT(140,0,200,100);
+    var nextTarget=new Native.RECT(80,0,200,100);
+    var motion=new TileMotion(start,oldTarget,100);
+    var retargeted=motion.Retarget(displayed,nextTarget,150);
+    if(!retargeted.From.Equals(displayed)||!retargeted.To.Equals(nextTarget)||retargeted.Started!=150)
+        throw new Exception("Retargeting must start at displayed pixels, not the old destination");
+    if(!motion.Retarget(displayed,oldTarget,150).Equals(motion))
+        throw new Exception("Repeated destinations must not restart the animation clock");
+    if(!new Settings().NativeWindowControls)throw new Exception("Native window controls must be the default");
+    Console.WriteLine("PASS: stale focus cancellation, continuous motion retargeting and native controls default.");
+}
 var defaults=new Settings();if(!defaults.DockEnabled||defaults.DockPosition!=DockPosition.Auto||defaults.SatelliteScale!=25||!defaults.DockMinimizedWindows)throw new Exception("Dock defaults");
 if(defaults.GlassOpacity!=65||!defaults.UseSameChromeOpacity||defaults.DockOpacity!=55||defaults.DesktopStripOpacity!=55||defaults.ReduceBlur)throw new Exception("Appearance defaults");
 if(defaults.DesktopStripPosition!=DesktopStripPosition.Top||!defaults.KeepMinisSameSize||defaults.AutoArrange||defaults.AutoArrangeGrid!=4||!defaults.AnimateLayout||defaults.DesktopTransition!=DesktopTransitionMode.Slide||defaults.BackgroundTheme!=BackgroundTheme.DarkBlueBlack||defaults.SmallWindowSize!=Settings.SmallWindowSizeDefault||Settings.SmallWindowSizeDefault!=700)throw new Exception("Strip/options defaults");
@@ -413,8 +440,8 @@ Console.WriteLine($"PASS: {checks} legacy grid scenarios plus top/bottom strip r
         throw new Exception("A completed StayView canvas gesture must re-front the browsed window");
     if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,false,0)!=BrowseTarget.Keep)
         throw new Exception("A fresh canvas foreground handoff must wait: not resurrect a closing window, not drop a live one to the grid");
-    if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,false,0,canvasSettled:true)!=BrowseTarget.Refront)
-        throw new Exception("A canvas that keeps the foreground while the focused window is still here must put that window back in front");
+    if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,false,0,canvasSettled:true)!=BrowseTarget.Grid)
+        throw new Exception("A settled canvas without an explicit gesture must not steal focus back to an old window");
     if(BrowseReconciler.ClassifyForeground(selected,canvas,canvas,true,true,200)!=BrowseTarget.Refront)
         throw new Exception("An explicit canvas gesture must win even if the handle also resolves to a source");
     if(BrowseReconciler.ClassifyForeground(selected,200,200,false,false,200)!=BrowseTarget.Follow)
@@ -456,6 +483,20 @@ if(FocusedClickPolicy.PinBlocksNonClient(1)||FocusedClickPolicy.PinBlocksNonClie
     ||!FocusedClickPolicy.PinBlocksNonClient(null,true)
     ||FocusedClickPolicy.PinBlocksNonClient(null,true,true)||FocusedClickPolicy.PinBlocksNonClient(2,false,true))
     throw new Exception("Pinned-window non-client policy must allow content/minimize/close and block move/resize/maximize");
+var customWindow = new Native.RECT(100,100,1200,800);
+var customCaption = new Native.POINT { X=690, Y=126 };
+var contentClick = new Native.POINT { X=690, Y=270 };
+var controlClick = new Native.POINT { X=1220, Y=125 };
+if(!FocusedClickPolicy.CanShrinkCustomCaption(1,"claude",customWindow,customCaption)
+    || !FocusedClickPolicy.CanShrinkCustomCaption(1,"CLAUDE",customWindow,customCaption)
+    || FocusedClickPolicy.CanShrinkCustomCaption(1,"chrome",customWindow,customCaption)
+    || FocusedClickPolicy.CanShrinkCustomCaption(2,"claude",customWindow,customCaption)
+    || FocusedClickPolicy.CanShrinkCustomCaption(9,"claude",customWindow,customCaption)
+    || FocusedClickPolicy.CanShrinkCustomCaption(1,"claude",customWindow,contentClick)
+    || FocusedClickPolicy.CanShrinkCustomCaption(1,"claude",customWindow,controlClick)
+    || FocusedClickPolicy.CanShrinkCustomCaption(1,"claude",new Native.RECT(100,100,400,150),customCaption))
+    throw new Exception("Claude custom-caption double-click must be restricted to the safe top-centre strip");
+Console.WriteLine("PASS: Claude custom title bar can shrink while ordinary client areas/controls stay native.");
 if (!FocusedClickPolicy.CanShrink(2) || !FocusedClickPolicy.CanDrag(2, false, false)) throw new Exception("Confirmed caption lost its overview gestures");
 if (!FocusedClickPolicy.CanShrink(null, true) || FocusedClickPolicy.CanShrink(1, true)) throw new Exception("Caption timeout fallback must work only when native hit testing is unknown");
 if(!FocusedClickPolicy.CanPinHold(2)||!FocusedClickPolicy.CanPinHold(null,true)
@@ -475,10 +516,27 @@ if(!PinnedWindowPolicy.NeedsHomeReturn(false,pinHome,Guid.NewGuid())
     ||PinnedWindowPolicy.NeedsHomeReturn(false,pinHome,Guid.Empty)
     ||PinnedWindowPolicy.NeedsHomeReturn(false,Guid.Empty,Guid.NewGuid()))
     throw new Exception("A pin stays on its home desktop and is only moved back there");
-if(!PinnedWindowPolicy.ParkInFrontPin(false,false)
-    ||PinnedWindowPolicy.ParkInFrontPin(true,false)
-    ||PinnedWindowPolicy.ParkInFrontPin(false,true))
-    throw new Exception("Only an in-front pin is parked as a tile when the desktop changes");
+{
+    nint fullPin=8;
+    var order=DesktopArrangement.FocusOnArrival(new nint[]{2,fullPin,1},new[]{fullPin},h=>h!=1,4);
+    if(!order.SequenceEqual(new nint[]{2,fullPin}))throw new Exception("Desktop focus preserves ordering and pins, excluding moved/closed windows");
+    if(DesktopArrangement.FocusOnArrival([],[],_=>true,4).Count!=0)throw new Exception("An unfocused desktop must remain unfocused");
+    if(!DesktopArrangement.FocusOnArrival([],new[]{fullPin},_=>true,0).SequenceEqual(new[]{fullPin}))throw new Exception("Full-size pins survive an otherwise unfocused desktop round trip");
+    if(DesktopArrangement.FocusOnArrival(new nint[]{1,2,3},[],_=>true,2).Count!=2)throw new Exception("Restored focus respects the configured allowance");
+}
+if(InputHooks.EscapeDismisses(true,true,false))throw new Exception("Esc belongs to the focused window under native controls");
+if(!InputHooks.EscapeDismisses(true,true,true))throw new Exception("Shift+Esc leaves even with a window in front");
+if(!InputHooks.EscapeDismisses(false,true,false)||!InputHooks.EscapeDismisses(true,false,false))throw new Exception("Esc on the grid, or without native controls, leaves");
+{
+    var work=new Native.RECT(0,0,1920,1040);
+    // A 7px invisible border each side; the visible frame starts 40px above the work area.
+    var offTop=FocusedWindowGeometry.KeepCaptionVisible(new Native.RECT(93,-40,1214,807),new Native.RECT(100,-40,1200,800),work);
+    if(!offTop.Equals(new Native.RECT(93,0,1214,807)))throw new Exception("A title bar above the work area moves down, unresized");
+    var onScreen=new Native.RECT(-300,5,800,600);
+    if(!FocusedWindowGeometry.KeepCaptionVisible(onScreen,new Native.RECT(-293,5,786,593),work).Equals(onScreen))throw new Exception("Native controls leave an on-screen title bar alone, even partly off the side");
+    var lowerMonitor=new Native.RECT(0,1080,1920,1040);
+    if(!FocusedWindowGeometry.KeepCaptionVisible(new Native.RECT(10,1060,800,600),new Native.RECT(10,1060,800,600),lowerMonitor).Equals(new Native.RECT(10,1080,800,600)))throw new Exception("Caption correction uses the window's own monitor work area");
+}
 if(PinnedWindowPolicy.CanFocus(true)||!PinnedWindowPolicy.CanFocus(false)
     ||PinnedWindowPolicy.CanDragTile(true)||!PinnedWindowPolicy.CanDragTile(false))
     throw new Exception("A pinned window must not expand on focus or be dragged");

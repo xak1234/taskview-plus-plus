@@ -1,4 +1,4 @@
-namespace StayView.Core;
+﻿namespace StayView.Core;
 
 // Trust the application's non-client hit test. Client areas include custom tabs,
 // toolbars and editors; their clicks must not become overview gestures.
@@ -37,6 +37,21 @@ public static class FocusedClickPolicy
     // that non-client band as draggable on a busy window.
     public static bool CanShrink(int? hit, bool fallbackCaption = false)
         => hit == 2 || (hit == null && fallbackCaption);
+
+    // Electron renders its draggable caption as HTCLIENT. Some apps (Claude)
+    // therefore have no ordinary HTCAPTION double-click for returning to the grid.
+    // This is intentionally narrow: only Claude's central top caption strip, never
+    // arbitrary client content, right-side caption controls or a window border.
+    // All normal controls, typing areas, tabs and other apps keep native clicks.
+    public static bool CanShrinkCustomCaption(int? hit, string? processName,
+        Native.RECT bounds, Native.POINT point)
+    {
+        if(hit!=1 || !string.Equals(processName,"claude",StringComparison.OrdinalIgnoreCase)
+            || bounds.Width<500 || bounds.Height<200) return false;
+        int x=point.X-bounds.Left,y=point.Y-bounds.Top;
+        return x>=bounds.Width*35/100 && x<=bounds.Width*65/100
+            && y>=8 && y<=42;
+    }
 
     // Pin/unpin uses the same safe title-bar classification as shrink, but is kept
     // separate so client-area right-drag can remain available without arming a pin hold.

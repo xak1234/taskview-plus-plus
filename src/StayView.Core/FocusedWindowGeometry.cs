@@ -105,6 +105,26 @@ public static class FocusedWindowGeometry
         return new Native.RECT(left, top, width, height);
     }
 
+    // Native window controls leave geometry alone, except a title bar above the work area,
+    // which cannot be grabbed to fix it. Move down only, never resize.
+    public static Native.RECT KeepCaptionVisible(Native.RECT window, Native.RECT visual, Native.RECT work)
+    {
+        if (work.Width < 1 || work.Height < 1 || visual.Top >= work.Top) return window;
+        return new Native.RECT(window.Left, window.Top + work.Top - visual.Top, window.Width, window.Height);
+    }
+
+    // Diagnostic: name the StayView move that sends a title bar above the work area.
+    // Checks the requested window rectangle (moves may be asynchronous); a Windows 11
+    // frame has no invisible top border, so its top is the caption's top.
+    public static void LogIfCaptionHidden(nint h, Native.RECT target, string source)
+    {
+        if (target.Width < 1 || target.Height < 1) return;
+        var probe = target;
+        var work = Native.WorkArea(Native.MonitorFromRect(ref probe, 2));
+        if (work.Height < 1 || target.Top >= work.Top) return;
+        Log.Write($"[geometry] {source} moving {h} '{Native.Title(h)}' to {target.Left},{target.Top},{target.Width},{target.Height}, above work {work.Left},{work.Top},{work.Width},{work.Height}");
+    }
+
     // Move the USER32 rectangle so the DWM frame it produces stays inside the work area.
     // Invisible resize margins may still lie outside; the border the user sees does not.
     public static Native.RECT FitWindowInside(Native.RECT window, Native.RECT visual, Native.RECT work)

@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using StayView.Core;
 
-static class Fixtures
+static partial class Fixtures
 {
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(nint context);
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

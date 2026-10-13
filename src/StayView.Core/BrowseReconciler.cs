@@ -54,7 +54,7 @@ public static class BrowseReconciler
     // the focused window dropping out by itself. So wait: a closing window is gone by the
     // next pass and the caller returns to the grid. `canvasSettled` means the canvas has
     // held the foreground past that wait while the selected window is still here, so it
-    // goes back in front.
+    // returns to the grid without an unsolicited foreground request.
     public static BrowseTarget ClassifyForeground(
         nint selected,
         nint foreground,
@@ -66,7 +66,8 @@ public static class BrowseReconciler
     {
         if (foreground == 0) return BrowseTarget.Keep; // transient activation handoff
         if (selected != 0 && (foreground == selected || foregroundRoot == selected)) return BrowseTarget.Keep;
-        if (foregroundIsOwnCanvas) return ownCanvasGesture || canvasSettled ? BrowseTarget.Refront : BrowseTarget.Keep;
+        if (foregroundIsOwnCanvas) return ownCanvasGesture ? BrowseTarget.Refront
+            : canvasSettled ? BrowseTarget.Grid : BrowseTarget.Keep;
         if (foregroundSource != 0 && foregroundSource != selected) return BrowseTarget.Follow;
         return BrowseTarget.Grid;
     }

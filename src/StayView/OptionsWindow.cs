@@ -85,9 +85,11 @@ sealed class OptionsWindow : Window
 
         // LAYOUT
         var layoutCard=Section(body,"Layout");
+        Setting(layoutCard,"Native window behaviour","Keep window positions and normal Windows mouse controls",
+            Toggle(settings.NativeWindowControls,v=>{settings.NativeWindowControls=v;settings.Save();}));
         Setting(layoutCard,"Auto-arrange","Keep windows in the Task View layout",
             Toggle(settings.AutoArrange,v=>{settings.AutoArrange=v;settings.Save();layoutChanged();}));
-        Setting(layoutCard,"Repel windows","Windows push each other aside while one is dragged",
+        Setting(layoutCard,"Repel windows","Arrange neighbouring previews while a preview is dragged",
             Toggle(settings.RepelWindows,v=>{settings.RepelWindows=v;settings.Save();}));
         Setting(layoutCard,"Focused windows","How many windows can be brought forward at once",
             Segmented(new[]{"1","2","3","4","5"},Math.Clamp(settings.MaxBrowsedWindows,1,5)-1,i=>{settings.MaxBrowsedWindows=i+1;settings.Save();layoutChanged();},true),stacked:true);

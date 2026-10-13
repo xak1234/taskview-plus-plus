@@ -28,6 +28,9 @@ public sealed class Settings
     public int MinimumTileWidth {get;set;}=300;
     public int SmallWindowSize {get;set;}=SmallWindowSizeDefault;
     public bool ShowTitles {get;set;}=true;
+    // Keep ordinary application gestures and desktop geometry under Windows' control.
+    // Missing in older settings files means on; the legacy StayView gestures remain opt-in.
+    public bool NativeWindowControls {get;set;}=true;
     // Soft animation: on opening, each miniature flies from its window's real screen
     // position into its slot, as Task View does. Exposed in Options.
     public bool AnimateLayout {get;set;}=true;

@@ -420,13 +420,14 @@ sealed class OverlayChrome : Window
             new Native.RECT(work.Left+(int)Math.Round((cardsRight+CardGap)*scale),laneTop,Math.Max(0,(int)Math.Round((canvas.Width-dockOuter-CardGap-cardsRight)*scale)),laneHeight));
         if(canCreateDesktop)
         {
+            double addHeight=Math.Min(height,32);
             var plus=new TextBlock {
-                Text="+",FontSize=Math.Clamp(width*.28,22,52),FontWeight=Microsoft.UI.Text.FontWeights.Light,
+                Text="+",FontSize=22,FontWeight=Microsoft.UI.Text.FontWeights.Light,
                 Foreground=GlassAppearance.PrimaryBrush(),HorizontalAlignment=HorizontalAlignment.Center,
                 VerticalAlignment=VerticalAlignment.Center,TextAlignment=TextAlignment.Center
             };
             var addCard=new Border {
-                Width=addWidth,Height=height,Child=plus,CornerRadius=new CornerRadius(9),
+                Width=addWidth,Height=addHeight,Child=plus,CornerRadius=new CornerRadius(7),
                 BorderThickness=new Thickness(2),BorderBrush=GlassAppearance.EdgeBrush(),
                 Background=GlassAppearance.SurfaceBrush2(Math.Max(35,settings.GlassOpacity-20))
             };
@@ -437,7 +438,7 @@ sealed class OverlayChrome : Window
             };
             // The + card speaks for itself; no caption under it. (The label is still
             // measured above only to keep the card's established width.)
-            Add(addCard,stripLayout.AddLeft,cardTop);
+            Add(addCard,stripLayout.AddLeft,cardTop+(height-addHeight)/2);
         }
 
         for (int desktopIndex=0; desktopIndex<desktops.Count; desktopIndex++)

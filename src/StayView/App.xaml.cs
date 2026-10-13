@@ -19,6 +19,7 @@ public partial class App:Application
             Environment.Exit(0);return;
         }
         mutex=new Mutex(true,"Local\\StayView.Singleton",out bool first);if(!first){Exit();return;}
+        Log.Write($"[build] path={Environment.ProcessPath} assembly={typeof(App).Assembly.ManifestModule.ModuleVersionId} core={typeof(OverviewSession).Assembly.ManifestModule.ModuleVersionId}");
         // Launch splash first; the (synchronous) load continues once it has painted.
         // The splash is cosmetic: if it cannot be created, start without it.
         SplashWindow? splash=null;

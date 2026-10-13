@@ -137,9 +137,11 @@ public sealed class PlacementStore
         int show=p.ShowCmd;
         if(show==1)p.ShowCmd=4; // Restore geometry without activating another desktop.
         else if(show is 2 or 6 or 7)p.ShowCmd=7;
-        bool ok=Native.SetWindowPlacement(h,ref p);
         var r=s.Bounds;
-        if(show==1 && Native.MonitorFromRect(ref r,0)!=0) {
+        bool onMonitor=show==1 && Native.MonitorFromRect(ref r,0)!=0;
+        FocusedWindowGeometry.LogIfCaptionHidden(h,onMonitor?s.Bounds:p.NormalPosition,"journal restore");
+        bool ok=Native.SetWindowPlacement(h,ref p);
+        if(onMonitor) {
             ok=Native.SetWindowPos(h,s.Topmost?-1:0,r.Left,r.Top,r.Width,r.Height,0x10|0x4000)&&ok;
         }else ok=Native.SetWindowPos(h,s.Topmost?-1:0,0,0,0,0,0x13|0x4000)&&ok;
         // A failed restore remains in the journal; never substitute an invented size.
@@ -151,6 +153,7 @@ public sealed class PlacementStore
     public static bool ApplyPendingGeometry(nint h,SavedPlacement saved)
     {
         var bounds=saved.Bounds;
+        FocusedWindowGeometry.LogIfCaptionHidden(h,saved.Bounds,"tile-drag placement");
         if(Native.IsIconic(h)||Native.IsZoomed(h)||Native.MonitorFromRect(ref bounds,0)==0)
         {
             var p=Native.Placement(h);

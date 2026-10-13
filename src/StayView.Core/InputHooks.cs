@@ -4,6 +4,7 @@ namespace StayView.Core;
 public sealed class InputHooks : IDisposable
 {
     readonly nint hwnd;
+    readonly Settings settings;
     readonly Native.HookProc keyCallback;
     readonly Native.HookProc mouseCallback;
     nint hook, mouseHook;
@@ -20,6 +21,8 @@ public sealed class InputHooks : IDisposable
         if (!value) { CancelRightHold(); dragArmed = false; dragging = false; dragButton=0; }
     } }
     public long GestureVersion { get; private set; }
+    // Counts new user intent even while the grid is up or a focus animation is pending.
+    public long InteractionVersion { get; private set; }
     bool lastWasCaption, lastWasClient;
     nint pendingClient;
     Native.POINT pendingFirst, pendingSecond;
@@ -35,6 +38,7 @@ public sealed class InputHooks : IDisposable
     public Func<Native.POINT,nint>? OverviewPinTarget;
     // The window a left-drag may move (the one currently browsed).
     public Func<nint>? BrowsedWindow;
+    public Func<nint,bool>? IsBrowsedWindow;
     // Builds, once per drag, the clamp that keeps the dragged window off the desktop bar.
     public Func<nint,Func<Native.RECT,Native.RECT>?>? StripClampFor;
     Func<Native.RECT,Native.RECT>? dragClamp;
@@ -64,12 +68,15 @@ public sealed class InputHooks : IDisposable
     public event Action? Escape;
     public event Action? Toggle;
     public event Action<nint>? PinToggle;
+    public event Action<nint>? TaskbarInvoked;
+    nint taskbarPreviousForeground;
+    bool taskbarPress;
     public event Action<nint>? DoubleClick; // the browsed/foreground window that was double-clicked
     public event Action<int>? DesktopDirection;
     public string HotkeyText { get; private set; } = "Ctrl + Win + Space";
     public InputHooks(nint hwnd, Settings settings)
     {
-        this.hwnd = hwnd; keyCallback = Keyboard; mouseCallback = Mouse; Register(settings);
+        this.hwnd = hwnd; this.settings=settings; keyCallback = Keyboard; mouseCallback = Mouse; Register(settings);
         hook = Native.SetWindowsHookEx(13, keyCallback, Native.GetModuleHandle(null), 0);
         mouseHook = Native.SetWindowsHookEx(14, mouseCallback, Native.GetModuleHandle(null), 0);
         if (hook == 0 && fallback) HotkeyText = "Use tray (hotkey unavailable)";
@@ -81,6 +88,23 @@ public sealed class InputHooks : IDisposable
         var mouse = Marshal.PtrToStructure<Native.MSLLHOOKSTRUCT>(lp);
         if (mouse.ExtraInfo == DragSentinel)
             return Native.CallNextHookEx(mouseHook, code, wp, lp);
+        if(msg is 0x201 or 0x204 or 0x207 or 0x20B or 0x20A or 0x20E)InteractionVersion++;
+        if(msg==0x201)
+        {
+            var root=Native.GetAncestor(Native.WindowFromPoint(mouse.Point),2);
+            taskbarPress=active && IsActive?.Invoke()==true
+                && Native.Class(root) is "Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or "TaskListThumbnailWnd";
+            if(taskbarPress)
+            {
+                var before=Native.GetForegroundWindow();
+                taskbarPreviousForeground=before==0?0:Native.GetAncestor(before,3);
+            }
+        }
+        if(msg==0x202 && taskbarPress)
+        {
+            taskbarPress=false;
+            TaskbarInvoked?.Invoke(taskbarPreviousForeground); // observe; never swallow Windows' taskbar click
+        }
         // The overview may have reopened between the second down and its up.
         // Consume the matching release even after browsing was disabled.
         if(msg==0x202 && swallowRelease){swallowRelease=false;return 1;}
@@ -225,7 +249,7 @@ public sealed class InputHooks : IDisposable
             long now = Environment.TickCount64; int dt = (int)Native.GetDoubleClickTime();
             int tolX = Math.Max(2, Native.GetSystemMetrics(36) / 2), tolY = Math.Max(2, Native.GetSystemMetrics(37) / 2);
             bool doubleClick = pressed != 0 && lastDown != 0 && lastDownTarget == pressed && now - lastDown <= dt && Math.Abs(p.X - lastDownPoint.X) <= tolX && Math.Abs(p.Y - lastDownPoint.Y) <= tolY;
-            if (canShrink && lastWasCaption && doubleClick)
+            if (canShrink && lastWasCaption && doubleClick && IsBrowsedWindow?.Invoke(pressed)==true)
             {
                 lastDown = 0; dragArmed = false; dragging = false; dragButton=0;
                 swallowRelease = true;
@@ -312,8 +336,29 @@ public sealed class InputHooks : IDisposable
         // title-bar gesture is why some windows never closed.
         if (FocusedClickPolicy.IsSystemCaptionButton(hit) || InCloseButton(p, r)) return false;
         bool fallbackCaption = hit == null && InFallbackCaption(p, r);
-        isClient = hit == 1;
+        isClient = !settings.NativeWindowControls && hit == 1;
+        // Returning a focused window to StayView is the user's explicit double-click
+        // gesture in either control mode. Native caption movement and single-click
+        // behaviour remain Windows-owned; only the second caption click is consumed.
         canShrink = FocusedClickPolicy.CanShrink(hit, fallbackCaption);
+        if(!canShrink && hit==1)
+        {
+            // Claude's Electron chrome answers HTCLIENT even on the draggable title.
+            // Query the process only in the narrow top-centre fallback region.
+            if(p.Y>=r.Top+8 && p.Y<=r.Top+42
+                && p.X>=r.Left+r.Width*35/100 && p.X<=r.Left+r.Width*65/100)
+            {
+                string? processName=null;
+                try
+                {
+                    Native.GetWindowThreadProcessId(target,out var appPid);
+                    if(appPid!=0)using(var app=System.Diagnostics.Process.GetProcessById((int)appPid))
+                        processName=app.ProcessName;
+                }
+                catch { }
+                canShrink=FocusedClickPolicy.CanShrinkCustomCaption(hit,processName,r,p);
+            }
+        }
         // Let Windows own ordinary caption drags, snap, restore-under-pointer and capture.
         // Only the explicit Win+drag gesture needs synthetic window movement.
         bool claim = winHeld && FocusedClickPolicy.CanDrag(hit, winHeld, false);
@@ -343,6 +388,19 @@ public sealed class InputHooks : IDisposable
         {
             var tile=OverviewPinTarget?.Invoke(p)??0;
             if(tile!=0 && Native.IsWindow(tile))return ArmStationaryPin(tile,p);
+            return false;
+        }
+        // Ordinary right clicks and right drags belong to the actual app under the
+        // pointer. Do not replay a delayed click or move an overlapping focused window.
+        // A title-bar hold pins the focused window, or releases an existing pin.
+        if(settings.NativeWindowControls)
+        {
+            var focusedRoot=Native.GetAncestor(Native.GetForegroundWindow(),2);
+
+            if(under!=0 && (IsPinnedWindow?.Invoke(under)==true || (browsing && under==focusedRoot))
+                && Native.GetWindowRect(under,out var pinRect)
+                && FocusedClickPolicy.CanPinHold(HitTest(under,p,pinRect)))
+                return ArmStationaryPin(under,p);
             return false;
         }
         var target=BrowsedWindow?.Invoke()??0;
@@ -405,13 +463,7 @@ public sealed class InputHooks : IDisposable
     // border/corner codes are the resize frame; HTCAPTION is the title bar.
     static int? HitTest(nint h, Native.POINT p, Native.RECT r)
     {
-        nint packed = (nint)(((uint)(p.Y & 0xFFFF) << 16) | (uint)(p.X & 0xFFFF));
-        // SMTO_ABORTIFHUNG | SMTO_BLOCK, 30 ms so a genuinely hung app cannot stall the hook.
-        if (Native.SendMessageTimeout(h, 0x0084, 0, packed, 0x0002 | 0x0001, 30, out var hit) != 0)
-        {
-            return (int)hit.ToInt64();
-        }
-        return null; // Uncertain hit tests must never swallow an app double-click.
+        return WindowHitTest.At(h,p);
     }
     static bool InFallbackCaption(Native.POINT p, Native.RECT r)
     {
@@ -470,12 +522,16 @@ public sealed class InputHooks : IDisposable
         rightHoldTriggered = false; rightHoldMoved = false; rightDragAllowed = false;
         dragArmed = false; dragging = false; dragButton = 0;
     }
+    // Esc belongs to a window focused in front of the overview (with native controls), so
+    // it can close its own dialogs. On the grid Esc leaves; Shift+Esc always leaves.
+    public static bool EscapeDismisses(bool browsing, bool nativeWindowControls, bool shift)
+        => shift || !browsing || !nativeWindowControls;
     nint Keyboard(int code, nint wp, nint lp)
     {
         if (code < 0) return Native.CallNextHookEx(hook, code, wp, lp);
         int key = Marshal.ReadInt32(lp);
         bool down = wp == 0x100 || wp == 0x104, up = wp == 0x101 || wp == 0x105;
-        if (down) { GestureVersion++; lastDown = 0; pendingClient = 0; }
+        if (down) { InteractionVersion++; GestureVersion++; lastDown = 0; pendingClient = 0; }
         // Track the Win key here (this hook sees every key up/down) so the mouse hook has
         // an authoritative held-state for Win+drag. GetAsyncKeyState proved unreliable
         // when queried from inside the mouse hook.
@@ -491,7 +547,8 @@ public sealed class InputHooks : IDisposable
         if (key == 27 && up && escapeHeld) { escapeHeld = false; return 1; }
         if (active && IsActive?.Invoke() == true && down)
         {
-            if (key == 27) { if (!escapeHeld) { escapeHeld = true; Escape?.Invoke(); } return 1; }
+            if (key == 27 && EscapeDismisses(browsing, settings.NativeWindowControls, Native.GetAsyncKeyState(0x10) < 0))
+            { if (!escapeHeld) { escapeHeld = true; Escape?.Invoke(); } return 1; }
             if ((key == 37 || key == 39) && ctrl && win) { DesktopDirection?.Invoke(key == 37 ? -1 : 1); return 1; }
         }
         return Native.CallNextHookEx(hook, code, wp, lp);

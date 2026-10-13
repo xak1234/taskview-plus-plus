@@ -21,12 +21,6 @@ public static class PinnedWindowPolicy
     public static bool NeedsHomeReturn(bool nativePinActive, Guid home, Guid owner) =>
         !nativePinActive && home != Guid.Empty && owner != Guid.Empty && owner != home;
 
-    // Changing desktop raises the overview and drops the browse. An in-front pin
-    // left HWND_TOPMOST then sits under that overview: its corner marker is lost
-    // and every later focus fight blanks the thumbnail. Park it as a tile pin.
-    // A tile pin, and a minimized pin, stay as they are.
-    public static bool ParkInFrontPin(bool tileOnly, bool minimized) => !tileOnly && !minimized;
-
     // A pin freezes the window. Focusing it must not expand it, and its tile must not move.
     public static bool CanFocus(bool pinned) => !pinned;
     public static bool CanDragTile(bool pinned) => !pinned;

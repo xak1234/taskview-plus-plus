@@ -1,10 +1,11 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 using StayView.Core;
 
 static class InteractionChecks
 {
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x,int y);
+    [DllImport("user32.dll")] static extern nint GetDlgItem(nint parent,int id);
     static Native.POINT Center(Native.RECT r)=>new(){X=r.Left+r.Width/2,Y=r.Top+r.Height/2};
     static void Button(bool down)
     {
@@ -13,6 +14,16 @@ static class InteractionChecks
     }
     static async Task Click(Native.POINT p)
     { SetCursorPos(p.X,p.Y); await Task.Delay(60); Button(true); await Task.Delay(60); Button(false); }
+    static async Task RightHold(Native.POINT point)
+    {
+        SetCursorPos(point.X,point.Y);await Task.Delay(80);
+        var down=new Native.INPUT { Type=0,Mouse=new Native.MOUSEINPUT { DwFlags=8u } };
+        var up=new Native.INPUT { Type=0,Mouse=new Native.MOUSEINPUT { DwFlags=16u } };
+        if(Native.SendInput(1,new[]{down},Marshal.SizeOf<Native.INPUT>())!=1)throw new Exception("Right press rejected");
+        try { await Task.Delay(1200); }
+        finally { Native.SendInput(1,new[]{up},Marshal.SizeOf<Native.INPUT>()); }
+        await Task.Delay(200);
+    }
     static async Task Drag(Native.POINT from,int dx,int dy)
     {
         SetCursorPos(from.X,from.Y); await Task.Delay(80); Button(true); await Task.Delay(80);
@@ -23,7 +34,7 @@ static class InteractionChecks
     static Native.RECT Bounds(nint h) { Native.GetWindowRect(h,out var r); return r; }
     static void Assert(bool value,string message) { if(!value)throw new Exception(message);Console.WriteLine("PASS: "+message); }
     static async Task Toggle(nint overlay) { Native.PostMessage(overlay,0x312,1,0);await Task.Delay(1100); }
-    public static async Task Run()
+    public static async Task Run(bool nativeOnly = false,bool desktopOnly = false,bool gridOnly = false)
     {
         nint overlay=0;
         for(int i=0;i<50 && overlay==0;i++)
@@ -54,15 +65,54 @@ static class InteractionChecks
             var tile=slots[group.FindIndex(w=>w.Handle==target)];
             await Toggle(overlay);
             Assert(Native.IsWindowVisible(overlay),"overview opened");
-            if(settings.AnimateLayout)
+            if(settings.AnimateLayout && !nativeOnly)
             {
                 await Click(Center(tile));await Task.Delay(20);
                 await Click(new Native.POINT { X=area.Left+1,Y=area.Top+1 });await Task.Delay(450);
                 Assert((Native.GetWindowLongPtr(overlay,-20).ToInt64()&8)!=0,"a rapid canvas press cancels pending focus without hiding the overview");
             }
-            await Click(Center(tile)); await Task.Delay(900);
+            await Click(Center(tile));
+            var focusWait=Stopwatch.StartNew();
+            while(Native.GetForegroundWindow()!=target && focusWait.ElapsedMilliseconds<250)await Task.Delay(10);
             Assert(Native.GetForegroundWindow()==target && !Native.IsIconic(target),"tile click focuses its real window");
             Assert(Bounds(target).Equals(original),"focus preserves real window geometry");
+            if(desktopOnly)
+            {
+                var desktopService=new VirtualDesktopService();
+                var home=desktopService.Current;
+                var other=desktopService.List().First(d=>d.Id!=home).Id;
+                async Task RoundTrip()
+                {
+                    try { Assert(desktopService.Switch(other),"switch to other desktop");await Task.Delay(900); }
+                    finally { desktopService.Switch(home);await Task.Delay(1200); }
+                }
+                await RoundTrip();
+                Assert(Native.GetForegroundWindow()==target,"ordinary focused window restored after desktop round trip");
+                if(!gridOnly)
+                {
+                    var roundTripCaption=new Native.POINT { X=Bounds(target).Left+150,Y=Bounds(target).Top+16 };
+                    await RightHold(roundTripCaption);
+                    Assert((Native.GetWindowLongPtr(target,-20).ToInt64()&8)!=0,"focused fixture pinned");
+                    await RoundTrip();
+                    Assert(Native.GetForegroundWindow()==target && (Native.GetWindowLongPtr(target,-20).ToInt64()&8)!=0,"full-size pinned focus restored after desktop round trip");
+                    await RightHold(roundTripCaption);
+                    }
+                await Toggle(overlay); // explicitly return to the unfocused grid
+                Assert(Native.GetForegroundWindow()==overlay,"returning to the grid releases the hidden app taskbar focus");
+                await RoundTrip();
+                Assert(Native.GetForegroundWindow()==overlay && (Native.GetWindowLongPtr(overlay,-20).ToInt64()&8)!=0,"unfocused grid remains unfocused after desktop round trip");
+                await Toggle(overlay);
+                Console.WriteLine("PASS: desktop focus round trips completed.");
+                return;
+            }
+
+            if(nativeOnly)
+            {
+                var button=GetDlgItem(target,101);
+                Assert(button!=0,"native fixture button exists");
+                await Click(Center(Bounds(button)));await Task.Delay(100);
+                Assert(Native.Title(target).Contains("native button clicked"),"first application click works immediately after selecting its tile");
+            }
             await Toggle(overlay);
             if(!settings.AutoArrange)
             {
@@ -83,7 +133,42 @@ static class InteractionChecks
             Assert(Native.GetForegroundWindow()==target && Bounds(target).Equals(moved),"shrink and refocus preserve both tile and real-window positions");
             var movedCaption=new Native.POINT { X=moved.Left+moved.Width/2,Y=moved.Top+(int)(15*dpi) };
             await Click(movedCaption);await Click(movedCaption);await Task.Delay(750);
-            Assert((Native.GetWindowLongPtr(overlay,-20).ToInt64()&8)!=0,"caption double-click shrinks back to the overview");
+            // An intentionally focused caption double-click returns to the StayView
+            // miniature in both native-control and custom-control modes.
+            Assert((Native.GetWindowLongPtr(overlay,-20).ToInt64()&8)!=0,
+                "caption double-click shrinks back to the overview");
+            Assert(!Native.IsZoomed(target),"caption double-click must not maximize the focused source");
+            if(settings.NativeWindowControls)
+            {
+                if(nativeOnly)
+                {
+                    await Click(Center(tile));await Task.Delay(900);
+                    Assert(Native.GetForegroundWindow()==target,
+                        "reopening the shrunk tile restores native focus");
+                    var logPath=Path.Combine(Settings.Folder,"stayview.log");
+                    int logStart=File.ReadAllText(logPath).Length;
+                    var currentBounds=Bounds(target);
+                    var dockFrom=new Native.POINT { X=currentBounds.Left+currentBounds.Width/2,Y=currentBounds.Top+(int)(15*dpi) };
+                    await RightHold(dockFrom);
+                    var pinLog=File.ReadAllText(logPath);
+                    Assert(pinLog[Math.Min(logStart,pinLog.Length)..].Contains($"[pin] pinned {target} at"),
+                        "title-bar hold pins a focused window with native controls enabled");
+                    Assert(Bounds(target).Equals(currentBounds),"pinning preserves the focused window placement");
+                    await RightHold(dockFrom);
+                    pinLog=File.ReadAllText(logPath);
+                    Assert(pinLog[Math.Min(logStart,pinLog.Length)..].Contains($"[pin] released {target}"),
+                        "another title-bar hold releases the pin");
+                    int dockY=settings.DesktopStripPosition==DesktopStripPosition.Top
+                        ? work.Top+(int)(40*dpi) : work.Bottom-(int)(40*dpi);
+                    await Drag(dockFrom,0,dockY-dockFrom.Y);
+                    await Task.Delay(500);
+                    var dockLog=File.ReadAllText(logPath);
+                    Assert(dockLog[Math.Min(logStart,dockLog.Length)..].Contains($"[dock] focused drag {target} -> dock"),
+                        "dragging a focused window onto the desktop bar docks it with native controls enabled");
+                    Console.WriteLine("PASS: native focus, first client click, preview drag, title-bar movement, shrink/refocus and bar docking checks completed.");
+                    return;
+                }
+            }
             await Click(Center(tile));await Task.Delay(900);
             Assert(Native.GetForegroundWindow()==target,"caption shrink leaves the remembered tile responsive");
             if(settings.MaxBrowsedWindows>1)
