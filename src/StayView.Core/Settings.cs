@@ -34,7 +34,7 @@ public sealed class Settings
     // Soft animation: on opening, each miniature flies from its window's real screen
     // position into its slot, as Task View does. Exposed in Options.
     public bool AnimateLayout {get;set;}=true;
-    public DesktopTransitionMode DesktopTransition {get;set;}=DesktopTransitionMode.Slide;
+    public DesktopTransitionMode DesktopTransition {get;set;}=DesktopTransitionMode.Appear;
     public bool AutoArrange {get;set;}
     // While a window is dragged, the others slide aside. Pinned windows stay put
     // either way. Off: the dragged window follows the pointer and nothing else moves.
@@ -98,8 +98,8 @@ public sealed class Settings
             // default. Keyed on SettingsVersion so a 450 the user picks later via the
             // slider is never migrated again.
             if(settings.SettingsVersion<1){if(settings.SmallWindowSize==450)settings.SmallWindowSize=SmallWindowSizeDefault;settings.SettingsVersion=1;}
-            // One-shot: the old default desktop transition (Appear) adopts the Task View slide.
-            if(settings.SettingsVersion<2){if(settings.DesktopTransition==DesktopTransitionMode.Appear)settings.DesktopTransition=DesktopTransitionMode.Slide;settings.SettingsVersion=2;}
+            // Retain an existing transition choice, including immediate presentation.
+            if(settings.SettingsVersion<2)settings.SettingsVersion=2;
             // One-shot: builds before version 3 persisted an unused StartWithWindows=false that
             // no UI ever showed. Save state wants it on by default; the user can turn it off.
             if(settings.SettingsVersion<3){settings.StartWithWindows=true;settings.SettingsVersion=3;}
@@ -107,7 +107,7 @@ public sealed class Settings
             settings.MaxBrowsedWindows=Math.Clamp(settings.MaxBrowsedWindows,MaxBrowsedWindowsMin,MaxBrowsedWindowsMax);
             if(!Enum.IsDefined(settings.BackgroundTheme))settings.BackgroundTheme=BackgroundTheme.DarkBlueBlack;
             // FlyIn is internal to the opening animation and is never a user choice here.
-            if(!Enum.IsDefined(settings.DesktopTransition)||settings.DesktopTransition==DesktopTransitionMode.FlyIn)settings.DesktopTransition=DesktopTransitionMode.Slide;
+            if(!Enum.IsDefined(settings.DesktopTransition)||settings.DesktopTransition==DesktopTransitionMode.FlyIn)settings.DesktopTransition=DesktopTransitionMode.Appear;
             return settings;
         } catch { return Fresh(); }
     }

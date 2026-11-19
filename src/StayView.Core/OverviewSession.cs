@@ -15,6 +15,7 @@ public sealed class OverviewSession : IDisposable
     readonly Dictionary<nint, Native.RECT> currentCells = [];
     readonly Dictionary<nint, int> arrangeOrder = [];
     readonly List<nint> docked = [];
+    readonly DockWindowCache dockWindows = new();
     readonly Dictionary<nint, Native.RECT> settling = [];
     // A miniature drag is now a real desktop placement edit. Keep the source HWND hidden
     // at its old location while the grid is up, but remember which saved placements must
@@ -36,17 +37,35 @@ public sealed class OverviewSession : IDisposable
     readonly Dictionary<nint,(int Count,long Since)> restoreAttempts = [];
     readonly HashSet<nint> selfMinimizing = [];
     readonly HashSet<nint> restoredSinceAttempt = [];
+    // Passive refresh must not restore a window merely because its desktop arrived.
+    // Permission comes from opening the overview or an explicit dock/restore action,
+    // and expires at the next desktop boundary.
+    readonly HashSet<nint> livePreviewSources = [];
     nint draggingTile;
     nint foreground;
     Guid observedDesktop;
+    public Guid ObservedDesktop => observedDesktop;
     public Guid PreviousDesktop { get; private set; }
     public nint Selected { get; private set; }
     public bool Active { get; private set; }
     public bool DragActive => draggingTile != 0;
     public IReadOnlyList<nint> DockedSources => docked;
     public bool IsDocked(nint h) => docked.Contains(h);
+    // Windows can raise an uncloaked source after the switch's initial render.
+    // Repair presentation on browse/foreground ticks too, without changing the
+    // user's geometry, show state, desktop ownership, or logical dock membership.
+    public void KeepSourcesBehind(nint overview, IEnumerable<nint> sources, IReadOnlyCollection<nint> browsed)
+    {
+        if(!Active || !Native.IsWindow(overview) || !Native.IsWindowVisible(overview))return;
+        foreach(var h in sources.Concat(docked).Distinct())
+        {
+            if(h==overview || !Native.IsWindow(h) || IsPinned(h)
+                || (!IsDocked(h) && browsed.Contains(h)) || !Native.IsAbove(h,overview))continue;
+            if(observedDesktop!=Guid.Empty && Desktops.WindowDesktop(h)!=observedDesktop)continue;
+            Native.SetWindowPos(h,1,0,0,0,0,0x13|0x4000); // BOTTOM, NOMOVE|NOSIZE|NOACTIVATE|ASYNC
+        }
+    }
     public Func<nint,bool>? IsPinnedWindow { get; set; }
-    public Func<nint,bool>? KeepMinimized { get; set; }
     public bool IsPinned(nint h) => IsPinnedWindow?.Invoke(h) == true;
     // Monitor -> screen rectangle of the desktop bar shown on it (empty when none).
     public Func<nint,Native.RECT>? StripBarFor { get; set; }
@@ -75,10 +94,14 @@ public sealed class OverviewSession : IDisposable
     public event Action? Leaving;
     public event Action<Guid>? DesktopRemoved;
     // Raised when the current virtual desktop actually changed while the overview is up,
-    // before the grid re-renders. TrayApp uses it to leave browse mode: the browsed
-    // window is on the old desktop, so the new desktop must show its grid, not stay
-    // dropped behind windows for a window that is no longer here.
+    // before the grid re-renders. TrayApp installs the destination's logical browse
+    // state here, without replaying any native placements or activation.
     public event Action? DesktopSwitched;
+    // A deliberate drag/transfer must invalidate any older per-desktop geometry.
+    public event Action<nint>? UserWindowMoved;
+    // Restore only StayView's selection, without activating/restoring/moving the HWND.
+    public void SelectForPresentation(nint h)
+        => Selected=Active && h!=0 && Native.IsWindow(h) && !IsDocked(h) ? h : 0;
     public OverviewSession(WindowCatalog catalog, VirtualDesktopService desktops, Settings settings,PlacementStore? placements=null)
     { this.catalog = catalog; Desktops = desktops; this.settings = settings; Placements=placements??new(); }
 
@@ -97,8 +120,17 @@ public sealed class OverviewSession : IDisposable
         minimizedOnEntry.Clear();
         minimizedDocked.Clear();
         userMinimized.Clear();
-        foreach (var w in catalog.Enumerate())
-            if (w.Minimized || Native.IsIconic(w.Handle)) { minimizedOnEntry.Add(w.Handle); minimizedDocked.Add(w.Handle); }
+        livePreviewSources.Clear();
+        // A dock can belong to an inactive virtual desktop. Scan all desktop
+        // sources on entry, otherwise reopening the overview on another desktop
+        // silently loses the minimized windows that were in the global dock.
+        foreach (var w in DesktopWindows())
+            if (w.Minimized || Native.IsIconic(w.Handle))
+            {
+                minimizedOnEntry.Add(w.Handle);minimizedDocked.Add(w.Handle);
+                if(observedDesktop!=Guid.Empty && Desktops.WindowDesktop(w.Handle)==observedDesktop)
+                    livePreviewSources.Add(w.Handle);
+            }
         ApplyDockMinimizedSetting();
         // Soft animation: the opening render flies each miniature in from its window's
         // real screen position, as Task View does. Signalled the same way a desktop
@@ -126,7 +158,7 @@ public sealed class OverviewSession : IDisposable
         // all-desktops pass so a manually docked window remains represented after the
         // user changes virtual desktop. Ordinary canvas tiles still come strictly from
         // the current desktop below.
-        var dockedWindows = all.Where(w => docked.Contains(w.Handle)).ToList();
+        var dockedWindows = dockWindows.Resolve(all, docked, Native.IsWindow);
         foreach(var h in arrangeOrder.Keys.Where(h=>!Native.IsWindow(h)).ToList())arrangeOrder.Remove(h);
         foreach(var h in positions.Keys.Where(h=>!Native.IsWindow(h)).ToList())positions.Remove(h);
         docked.RemoveAll(h=>!Native.IsWindow(h));
@@ -176,13 +208,9 @@ public sealed class OverviewSession : IDisposable
             output[m] = tiles;
         }
         LayoutChanged?.Invoke(output);
-        // A minimized source can stop supplying live DWM content, leaving only the
-        // tile's hover outline visible. While the overview grid is up, keep minimized
-        // sources restored at their real normal placement behind the opaque overlay so
-        // their thumbnails remain live. The original show-state is still journaled and
-        // restored when StayView exits.
-        // A global dock source can belong to another virtual desktop. Keep its DWM source
-        // live just like a current-desktop dock source; this never changes desktop ownership.
+        // Live previews may restore only sources authorized by overview entry or an
+        // explicit dock/restore action on this visit. Desktop arrival grants no such
+        // permission; minimized and foreign sources retain their native show state.
         RestoreMinimizedSourcesForOverview(
             windows.Concat(dockedWindows).GroupBy(w => w.Handle).Select(g => g.First()));
     }
@@ -200,9 +228,11 @@ public sealed class OverviewSession : IDisposable
         if (!Active || draggingTile != 0) return;
         RestoreMinimizedSourcesForOverview(catalog.Enumerate());
     }
-    public void RestoreMinimizedSourceForOverview(nint h)
+    public void RestoreMinimizedSourceForOverview(nint h,bool userRequested=false)
     {
         if (!Active || h == 0 || !Native.IsWindow(h) || !Native.IsIconic(h) || userMinimized.Contains(h)) return;
+        if(userRequested)livePreviewSources.Add(h);
+        if(!livePreviewSources.Contains(h))return;
         // Some apps (tray panels such as Windscribe) minimize themselves again whenever
         // they lose focus. Restoring them every tick flashes their tile forever, so a window
         // that re-minimizes three times within a few seconds is left minimized this session.
@@ -274,6 +304,7 @@ public sealed class OverviewSession : IDisposable
         // never repacks untouched tiles and an undocked tile returns to its old spot.
         if(!settings.AutoArrange)foreach(var pair in currentCells)positions.TryAdd(pair.Key,pair.Value);
         if(!docked.Contains(h))docked.Add(h);
+        dockWindows.Remember(new AppWindow(h,Native.Title(h),Native.MonitorFromWindow(h,2),Native.IsIconic(h),false));
         arrangeOrder.Remove(h);currentCells.Remove(h);
         Reflow();
         return true;
@@ -285,6 +316,7 @@ public sealed class OverviewSession : IDisposable
         if(dock)
         {
             if(!docked.Contains(h))docked.Add(h);
+            dockWindows.Remember(new AppWindow(h,Native.Title(h),Native.MonitorFromWindow(h,2),Native.IsIconic(h),false));
             if(minimized)minimizedDocked.Add(h);else minimizedDocked.Remove(h);
             arrangeOrder.Remove(h);
             currentCells.Remove(h);
@@ -323,6 +355,7 @@ public sealed class OverviewSession : IDisposable
         // The user put this one back on the canvas themselves; a later settings change
         // must not silently re-dock it just because it opened minimized.
         minimizedOnEntry.Remove(h);
+        RestoreMinimizedSourceForOverview(h,userRequested:true);
         Reflow();
         return true;
     }
@@ -498,11 +531,11 @@ public sealed class OverviewSession : IDisposable
         // desktop switching and passive thumbnail restoration can both focus
         // a dock source. Only a tile/taskbar restore may clear its state.
         if(!WindowActivationPolicy.CanActivate(docked.Contains(h),
-            minimizedDocked.Contains(h),userMinimized.Contains(h),requestForeground,restoreDocked))return false;
+            minimizedDocked.Contains(h),userMinimized.Contains(h),restoreDocked))return false;
         var current=Desktops.Current;
         var owner=Desktops.WindowDesktop(h);
         if(!IsPinned(h)&&(current!=Guid.Empty && owner!=Guid.Empty ? owner!=current : !Desktops.IsCurrent(h)))return false;
-        if(requestForeground)PrepareActivationGeometry(h);
+        if(restoreDocked)PrepareActivationGeometry(h);
         bool userIsRestoring = Placements.Entries.TryGetValue(h, out var savedBefore)
             && savedBefore.Placement.ShowCmd is 2 or 6 or 7;
         // A minimized source restores to ITS saved normal rectangle, not a canvas rect.
@@ -520,11 +553,11 @@ public sealed class OverviewSession : IDisposable
             if(Native.IsIconic(h))return false;
         }
         // The first geometry pass may have run while the HWND was still iconic.
-        if(requestForeground)PrepareActivationGeometry(h);
+        if(restoreDocked)PrepareActivationGeometry(h);
         // Restore/placement APIs can legally produce a frame whose caption sits above the
         // current work area (stale monitor topology, workspace offsets, or app self-moves).
         // Correct it before foreground handoff so the focused title bar never appears offscreen.
-        if(requestForeground)EnsureActivationTopVisible(h);
+        if(restoreDocked)EnsureActivationTopVisible(h);
         // Lift off the bottom of the z-order (overview keeps sources lowered) and focus.
         // A denied z-order request (e.g. an elevated console) must not prevent the
         // independent foreground request. Cross-thread activation completes asynchronously;
@@ -548,13 +581,13 @@ public sealed class OverviewSession : IDisposable
         // Focusing a previously minimized tile is a new explicit user state. Replace the
         // journal's old minimized show-state now that the real window is restored, so an
         // eventual StayView dismissal does not minimize it again behind the user's back.
-        if(userIsRestoring || (tileMoved.Contains(h) && !Native.IsZoomed(h)))
+        if(restoreDocked && (userIsRestoring || (tileMoved.Contains(h) && !Native.IsZoomed(h))))
         {
             RecaptureUserPlacement(h);
             tileMoved.Remove(h);
             minimizedOnEntry.Remove(h);
         }
-        if(requestForeground || restoreDocked)
+        if(restoreDocked)
         {
             if(docked.Remove(h))Log.Write($"[dock] explicit activation released {h}");
             minimizedOnEntry.Remove(h);
@@ -593,24 +626,6 @@ public sealed class OverviewSession : IDisposable
         // user never chose).
         else { presentationOffset.Remove(h); presentedAt.Remove(h); }
     }
-    // Focusing a tile expands the window over that tile: move the real window (position
-    // only) so its visible frame is centred on the tile, inside the work area. This is an
-    // overview-only presentation, so it is NOT journaled: dismissal puts the window back
-    // where it was, unless the user moves it themselves (NoteUserMoved recaptures).
-    public bool CenterOverTile(nint h)
-    {
-        if(settings.NativeWindowControls)return false;
-        // A tile the user dragged already carries their chosen placement for this window
-        // (PrepareActivationGeometry applies it, and Activate applies it again): centring
-        // would expand to one spot and then jump to the other.
-        if(!Active || h==0 || tileMoved.Contains(h) || !Native.IsWindow(h) || Native.IsIconic(h) || Native.IsZoomed(h) || IsPinned(h)
-            || !currentCells.TryGetValue(h,out var cell)
-            || !Native.GetWindowRect(h,out var window) || !Native.TryGetVisualBounds(h,out var visual))return false;
-        var monitor=Native.MonitorFromWindow(h,2);
-        if(monitor==0)return false;
-        var target=FocusedWindowGeometry.CenterOver(window,visual,cell,Native.WorkArea(monitor));
-        return MovePresented(h,target.Left,target.Top);
-    }
     // How far StayView has moved each window purely for the overview (centre over tile,
     // off the desktop bar, clear of a pin). Every automatic journal update takes this back
     // out, so only placement the user chose is restored on dismissal. A move the user
@@ -645,15 +660,6 @@ public sealed class OverviewSession : IDisposable
         var clear=KeepOffStrip(h,moved);
         MovePresented(h,clear.Left,clear.Top);
     }
-    // Where the focus animation of a visible frame ends: inside the work area, off the bar.
-    // Must match what EnsureActivationTopVisible does to the real window.
-    public Native.RECT FocusTarget(nint monitor, Native.RECT visual)
-    {
-        if(settings.NativeWindowControls)return visual;
-        var work=Native.WorkArea(monitor);
-        var fitted=FocusedWindowGeometry.FitInside(visual,work);
-        return FocusedWindowGeometry.MoveOffBar(fitted,0,0,fitted.Width,fitted.Height,StripBar(monitor),work);
-    }
     public bool EnsureActivationTopVisible(nint h)
     {
         if(!Active || h==0 || !Native.IsWindow(h) || Native.IsIconic(h) || Native.IsZoomed(h)
@@ -665,11 +671,11 @@ public sealed class OverviewSession : IDisposable
         if(monitor==0)return false;
         var work=Native.WorkArea(monitor);
         bool changed=false;
-        // A frame outside the work area is a real placement fault: fix it and journal it.
-        // Native controls fix only a title bar above the work area, without resizing.
-        var corrected=settings.NativeWindowControls
-            ?FocusedWindowGeometry.KeepCaptionVisible(windowBounds,visualBounds,work)
-            :FocusedWindowGeometry.FitWindowInside(windowBounds,visualBounds,work);
+        // Focus never resizes a real HWND, even in custom-control mode. Only move
+        // one whose entire accessible caption lies above the monitor work area.
+        // Small user-chosen offsets and overlaps with the desktop strip stay intact.
+        if(visualBounds.Top+32>=work.Top)return false;
+        var corrected=FocusedWindowGeometry.KeepCaptionVisible(windowBounds,visualBounds,work);
         if(!corrected.Equals(windowBounds))
         {
             Log.Write($"[geometry] {h} '{Native.Title(h)}' frame {visualBounds.Left},{visualBounds.Top},{visualBounds.Width},{visualBounds.Height} outside work {work.Left},{work.Top},{work.Width},{work.Height}; moved to {corrected.Left},{corrected.Top}");
@@ -678,13 +684,6 @@ public sealed class OverviewSession : IDisposable
             Placements.UpdateGeometry(h,offset.X,offset.Y);
             changed=true;
         }
-        if(settings.NativeWindowControls)return changed;
-        // The desktop bar only exists while the overview is up. Slide the frame off it
-        // without resizing, as presentation only, so dismissal restores the user's spot.
-        var visible=FocusedWindowGeometry.FitInside(visualBounds,work);
-        int leftMargin=visualBounds.Left-windowBounds.Left,topMargin=visualBounds.Top-windowBounds.Top;
-        var clear=FocusedWindowGeometry.MoveOffBar(corrected,leftMargin,topMargin,visible.Width,visible.Height,StripBar(monitor),work);
-        if(MovePresented(h,clear.Left,clear.Top))changed=true;
         return changed;
     }
     // Focused native Minimize means "dock" while StayView is active. Establish the dock
@@ -704,7 +703,7 @@ public sealed class OverviewSession : IDisposable
     public void CancelUserMinimize(nint h)
     {
         if(!Active || Native.IsIconic(h) || !userMinimized.Remove(h))return;
-        minimizedDocked.Remove(h);
+        if(!docked.Contains(h))minimizedDocked.Remove(h);
     }
     public void NoteUserMinimized(nint h)
     {
@@ -722,7 +721,7 @@ public sealed class OverviewSession : IDisposable
         userMinimized.Remove(h);
         if(!docked.Contains(h) && !DockTile(h)){ userMinimized.Add(h); return false; }
         minimizedDocked.Add(h);
-        RestoreMinimizedSourceForOverview(h);
+        RestoreMinimizedSourceForOverview(h,userRequested:true);
         return true;
     }
     // The minimize itself has no reliable completion event, so grid maintenance finishes
@@ -786,7 +785,10 @@ public sealed class OverviewSession : IDisposable
         if (!Active || h == 0 || id == Guid.Empty || !Native.IsWindow(h) || IsPinned(h)) return false;
         if(!PlacementStore.TrySnapshot(h,0,Desktops.WindowDesktop(h),out var before))return false;
         if(Placements.Capture(h,0,before.DesktopId))Placements.Persist();
-        if (!Desktops.Move(h, id)) return false;
+        // A reposition on the SAME desktop must not move the HWND between virtual
+        // desktops or silently undock it. Only an actual transfer changes membership.
+        bool changingDesktop=before.DesktopId==Guid.Empty || before.DesktopId!=id;
+        if (changingDesktop && !Desktops.Move(h, id)) return false;
         if(dropBounds is Native.RECT rect)
         {
             // A drag is explicit placement intent; normalize maximized/minimized windows
@@ -794,7 +796,7 @@ public sealed class OverviewSession : IDisposable
             if(Native.IsIconic(h)||Native.IsZoomed(h))Native.ShowWindow(h,4);
             if(Native.IsIconic(h)||!Native.SetWindowPos(h,0,rect.Left,rect.Top,rect.Width,rect.Height,0x14))
             {
-                if(before.DesktopId!=Guid.Empty)Desktops.Move(h,before.DesktopId);
+                if(changingDesktop && before.DesktopId!=Guid.Empty)Desktops.Move(h,before.DesktopId);
                 PlacementStore.RestoreOne(before,Desktops);
                 Log.Write("Desktop drop placement failed for "+h);
                 Reflow();return false;
@@ -805,12 +807,16 @@ public sealed class OverviewSession : IDisposable
         Placements.SetDesktop(h, id);
         if(dropBounds!=null){Placements.Recapture(h);tileMoved.Remove(h);userMinimized.Remove(h);}
         presentationOffset.Remove(h); presentedAt.Remove(h);
-        docked.Remove(h);
-        minimizedDocked.Remove(h);
-        minimizedOnEntry.Remove(h);
+        if(changingDesktop)
+        {
+            docked.Remove(h);
+            minimizedDocked.Remove(h);
+            minimizedOnEntry.Remove(h);
+        }
         positions.Remove(h);
         currentCells.Remove(h);
         arrangeOrder.Remove(h);
+        UserWindowMoved?.Invoke(h);
         Reflow();
         return true;
     }
@@ -868,6 +874,7 @@ public sealed class OverviewSession : IDisposable
     void DesktopChanged()
     {
         if(!Active)return;
+        livePreviewSources.Clear();
         // Mark only actual desktop switches for delivery animation. Ordinary reflows
         // (window open/close, docking, monitor changes, removing an inactive desktop)
         // remain stable and never replay it.
@@ -877,8 +884,7 @@ public sealed class OverviewSession : IDisposable
         int from=order.IndexOf(PreviousDesktop),to=order.IndexOf(observedDesktop);
         DesktopTransitionDirection=from>=0&&to>=0&&to<from?-1:1;
         DesktopTransitionVersion++;
-        // Clear browse state (via the subscriber) BEFORE the reflow, so the new desktop's
-        // grid renders topmost instead of staying dropped for a window left behind.
+        // Install the destination's presentation before its single render pass.
         DesktopSwitched?.Invoke();
         Reflow();
     }
@@ -895,7 +901,7 @@ public sealed class OverviewSession : IDisposable
         var toMinimize = docked.Where(h => Native.IsWindow(h) && !Native.IsIconic(h)).ToList();
         // Restore behind the still-opaque canvas, then uncover the normal desktop.
         try { Placements.Restore(); foreach (var h in toMinimize) Native.ShowWindowAsync(h, 6); } // SW_MINIMIZE
-        finally { draggingTile=0; Leaving?.Invoke(); positions.Clear(); currentCells.Clear(); arrangeOrder.Clear(); docked.Clear(); settling.Clear(); tileMoved.Clear(); minimizedOnEntry.Clear(); minimizedDocked.Clear(); userMinimized.Clear(); restoreAttempts.Clear(); selfMinimizing.Clear(); restoredSinceAttempt.Clear(); presentationOffset.Clear(); presentedAt.Clear(); Selected = 0; }
+        finally { draggingTile=0; Leaving?.Invoke(); positions.Clear(); currentCells.Clear(); arrangeOrder.Clear(); docked.Clear(); dockWindows.Clear(); settling.Clear(); tileMoved.Clear(); minimizedOnEntry.Clear(); minimizedDocked.Clear(); userMinimized.Clear(); restoreAttempts.Clear(); selfMinimizing.Clear(); restoredSinceAttempt.Clear(); livePreviewSources.Clear(); presentationOffset.Clear(); presentedAt.Clear(); Selected = 0; }
         if (Native.IsWindow(foreground) && Desktops.IsCurrent(foreground)) Native.SetForegroundWindow(foreground);
     }
     public void Dispose() => Exit();

@@ -93,7 +93,12 @@ public sealed class WindowCatalog:IDisposable
         if(excludedProcesses.Contains(name))return "excluded process "+name;
         if(!allDesktops&&!OnCurrentDesktop(h))return "not on current desktop";
         Native.DwmGetWindowAttribute(h,14,out var cloaked,4);
-        if(cloaked!=0&&!(allDesktops&&cloaked==2&&desktops.Available))return "cloaked "+cloaked;
+        // During the shell switch the destination can already be current while
+        // its windows remain shell-cloaked for a frame. Keep its known sources
+        // instead of rendering an empty grid and rebuilding them on a later tick.
+        bool shellTransition=cloaked==2 && desktops.Available
+            && (allDesktops || (enumCurrent!=Guid.Empty && desktops.WindowDesktop(h)==enumCurrent));
+        if(cloaked!=0&&!shellTransition)return "cloaked "+cloaked;
         var title=Native.Title(h);if(string.IsNullOrWhiteSpace(title))return "empty title";
         Native.GetWindowRect(h,out var r);
         bool min=Native.IsIconic(h);

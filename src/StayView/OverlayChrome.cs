@@ -195,9 +195,14 @@ sealed class OverlayChrome : Window
         }
         return Native.CallWindowProc(originalProc, h, msg, wp, lp);
     }
-    public void Render(nint monitor, IReadOnlyList<Tile> tiles, string hotkey)
+    public void Render(nint monitor, IReadOnlyList<Tile> tiles, string hotkey,
+        IReadOnlyList<nint> shownSources,IReadOnlySet<nint> pinnedSources)
     {
         if (IsDragging) return;
+        // Install the arriving desktop's logical presentation before the one
+        // render. Do not first publish an empty grid and then expand it again.
+        browsed.Clear();browsed.AddRange(shownSources);
+        pinnedBrowsed.Clear();pinnedBrowsed.UnionWith(pinnedSources.Where(browsed.Contains));
         var nextWork = Native.WorkArea(monitor);
         bool geometryChanged = !work.Equals(nextWork);
         work = nextWork;
@@ -226,9 +231,11 @@ sealed class OverlayChrome : Window
         Add(options, 14, 14);
         // No on-canvas exit button: Esc dismisses the overview, and the tray menu (or the
         // Exit button in Options) quits the app.
-        var transition=session.DesktopTransitionVersion!=transitionVersionSeen?session.DesktopTransition:DesktopTransitionMode.Appear;
+        bool changed=session.DesktopTransitionVersion!=transitionVersionSeen;
+        var transition=changed?session.DesktopTransition:DesktopTransitionMode.Appear;
         transitionVersionSeen=session.DesktopTransitionVersion;
-        tilesView.Render(tiles, work, scale, transition);
+        tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),FocusedBrowsed(),pinnedBrowsed);
+        tilesView.Render(tiles, work, scale, transition,changed && transition!=DesktopTransitionMode.FlyIn);
         root.UpdateLayout();
         surfaceReady = true;
         if (!Native.IsWindowVisible(Handle))
@@ -301,8 +308,9 @@ sealed class OverlayChrome : Window
     public void ReassertBrowseZOrder()
     {
         if (browsed.Count == 0 || !Native.IsWindowVisible(Handle)) return;
+        // Mouse/activation messages already queue a deferred repair. The periodic
+        // check must not send another z-order request every tick.
         KeepBelowBrowsed();
-        Native.PostMessage(Handle, ReassertBrowseZOrderMessage, 0, 0);
     }
     public void RefreshBrowseGeometry()
     {
@@ -334,6 +342,7 @@ sealed class OverlayChrome : Window
         var live = browsed.Where(s=>Native.IsWindow(s)&&Native.IsWindowVisible(s)&&!Native.IsIconic(s)).ToList();
         if (live.Count == 0)
         {
+            LowerSmallSources();
             tilesView.SetBrowsePresentation(browsed,Array.Empty<nint>(),0,pinnedBrowsed);
             return;
         }
@@ -353,9 +362,13 @@ sealed class OverlayChrome : Window
             // directly beneath it. This preserves whichever source the user just clicked/moved.
             var lowest = normal[0];
             for (int i = 1; i < normal.Count; i++) if (Native.IsAbove(lowest, normal[i])) lowest = normal[i];
-            Native.SetWindowPos(Handle, lowest, 0, 0, 0, 0, 0x13);
+            if (!Native.IsAbove(lowest, Handle))
+                Native.SetWindowPos(Handle, lowest, 0, 0, 0, 0, 0x13);
         }
 
+        // Uncloaking can raise a parked source after Render's one-off lowering.
+        // Maintain both sides of the invariant while focused windows/pins are up.
+        LowerSmallSources();
         // Hard invariant: a miniature is suppressed only if its real source is demonstrably
         // above this opaque overview RIGHT NOW. If Windows/WinUI is still settling z-order,
         // leave that miniature visible at the real HWND rectangle until the posted retry.
@@ -765,9 +778,7 @@ sealed class OverlayChrome : Window
         // restores the original order/topmost state when Overview exits.
         // The browsed window is the one the user is working in, in front of the overview;
         // it is never sent to the bottom by a reflow that happens while it is focused.
-        foreach(var source in tilesView.Sources)
-            if(!browsed.Contains(source) && Native.IsWindow(source))
-                Native.SetWindowPos(source,1,0,0,0,0,0x13);
+        session.KeepSourcesBehind(Handle,tilesView.Sources,browsed);
     }
     // Drop tiles whose source window has closed, so no clickable ghost is left behind.
     public void PruneDeadTiles() => tilesView.PruneDead();

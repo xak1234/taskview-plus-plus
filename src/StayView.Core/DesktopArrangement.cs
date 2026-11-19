@@ -20,6 +20,13 @@ public static class DesktopArrangement
 {
     public static bool Include(bool pinned) => !pinned;
 
+    // A direct drag in a popped-out desktop changes the real HWND placement.
+    // Invalidate its older snapshots so a later return does not undo that drag.
+    public static void ForgetStalePlacement(Dictionary<Guid,Dictionary<nint,DesktopWindowState>> states,nint handle)
+    {
+        foreach(var snapshot in states.Values) snapshot.Remove(handle);
+    }
+
     // A cloaked/temporarily hidden source can disappear from one enumeration.
     // Merge that partial sample instead of deleting its last known arrangement.
     public static Dictionary<nint,DesktopWindowState> MergeSnapshots(

@@ -69,6 +69,7 @@ public sealed class InputHooks : IDisposable
     public event Action? Toggle;
     public event Action<nint>? PinToggle;
     public event Action<nint>? TaskbarInvoked;
+    public event Action? TaskbarPressed;
     nint taskbarPreviousForeground;
     bool taskbarPress;
     public event Action<nint>? DoubleClick; // the browsed/foreground window that was double-clicked
@@ -98,6 +99,7 @@ public sealed class InputHooks : IDisposable
             {
                 var before=Native.GetForegroundWindow();
                 taskbarPreviousForeground=before==0?0:Native.GetAncestor(before,3);
+                TaskbarPressed?.Invoke();
             }
         }
         if(msg==0x202 && taskbarPress)

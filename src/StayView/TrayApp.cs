@@ -42,8 +42,7 @@ sealed class TrayApp
             // focused window appears a few pixels away, which reads as a final jump.
             if(!Native.IsIconic(h) && Native.TryGetVisualBounds(h,out var r))
             {
-                var monitor=Native.MonitorFromWindow(h,2);
-                bounds[h]=monitor==0?r:session.FocusTarget(monitor,r);
+                bounds[h]=r;
                 continue;
             }
             // Once Windows has completed a minimize, GetWindowRect is no longer the real
@@ -53,8 +52,7 @@ sealed class TrayApp
             // restoring/flashing the real HWND just to obtain geometry.
             if(session.Placements.Entries.TryGetValue(h,out var saved))
             {
-                var savedBounds=saved.Bounds; var monitor=Native.MonitorFromWindow(h,2);
-                bounds[h]=monitor==0?savedBounds:session.FocusTarget(monitor,savedBounds);
+                bounds[h]=saved.Bounds;
             }
         }
         return bounds;
@@ -72,10 +70,9 @@ sealed class TrayApp
     // the user clicks the tile, which turns it into an ordinary (in-front) pin.
     sealed record PinState(Guid HomeDesktop,Native.RECT Bounds,bool Maximized,bool SystemPinned,bool OwnsSystemPin,bool TileOnly=false);
     readonly Dictionary<nint,PinState> pinnedWindows = [];
-    readonly Dictionary<Guid,Dictionary<nint,DesktopWindowState>> desktopStates = [];
     readonly Dictionary<Guid,nint[]> desktopFocus = [];
-    int desktopRestoreVersion;
-    bool desktopRestorePending;
+    long desktopPresentationInteraction=-1;
+    bool PreserveDesktopPresentation => desktopPresentationInteraction==input.InteractionVersion;
     bool preserveWindowState;
     nint popoutSavedForeground;
     DispatcherTimer? popoutSettle;
@@ -249,6 +246,7 @@ sealed class TrayApp
     {
         if(!session.Active || h==0 || !Native.IsWindow(h))
         { overviewMinimizing.Remove(h); return; }
+        if(PreserveDesktopPresentation)return;
         if(!started)
         {
             // The window is being restored. If StayView had not finished docking it yet,
@@ -322,41 +320,23 @@ sealed class TrayApp
         return true;
     }
     void ReleaseAllPins(){foreach(var h in pinnedWindows.Keys.ToList())ReleasePin(h);}
-    // Suspend only the z-order of pins left behind. TileOnly is user state: a
-    // desktop switch must never turn a full-size pin into an unfocused tile.
-    void SuspendDepartingPins()
-    {
-        foreach(var (h,pin) in pinnedWindows)
-            if(!pin.TileOnly && !pin.SystemPinned && Native.IsWindow(h) && !IsCurrentDesktopStable(h))
-                Native.SetWindowPos(h,(nint)(-2),0,0,0,0,0x13|0x4000);
-    }
-    void PrunePins(bool reconcileDesktop=false)
+    void PrunePins()
     {
         bool changed=false;
         foreach(var h in pinnedWindows.Keys.ToList())
         {
             if(!Native.IsWindow(h)){ReleasePin(h);changed=true;continue;}
-            var pin=pinnedWindows[h];
-            // Reconcile only at a real desktop boundary. A pin stays on the desktop
-            // where it was pinned. Carrying it onto the desktop just created or
-            // switched to is what mixes up pin identity and desktop membership.
-            // A working native view pin already spans every desktop; moving it
-            // would make Windows clear that pin.
-            if(reconcileDesktop)
-            {
-                bool nativePinActive=pin.SystemPinned&&desktops.IsWindowPinned(h);
-                var owner=desktops.WindowDesktop(h);
-                if(PinnedWindowPolicy.NeedsHomeReturn(nativePinActive,pin.HomeDesktop,owner)
-                    &&desktops.Move(h,pin.HomeDesktop))
-                    Log.Write($"[pin] {h} put back on its desktop {pin.HomeDesktop} (was {owner})");
-            }
+            // The shell owns desktop membership. A switch never sends a pin
+            // home or replays its native placement while it is being uncloaked.
             RestorePinnedGeometry(h);
         }
         if(changed)PublishBrowsed();
     }
     void RestorePinnedGeometry(nint h)
     {
-        if(!pinnedWindows.TryGetValue(h,out var pin)||pinRestoring.Contains(h)||!Native.IsWindow(h)||Native.IsIconic(h))return;
+        if(PreserveDesktopPresentation || !IsCurrentDesktopStable(h)
+            || !pinnedWindows.TryGetValue(h,out var pin)||pinRestoring.Contains(h)||!Native.IsWindow(h)||Native.IsIconic(h))return;
+        if(Native.DwmGetWindowAttribute(h,14,out var cloaked,4)!=0 || cloaked!=0)return;
         try
         {
             pinRestoring.Add(h);
@@ -417,113 +397,25 @@ sealed class TrayApp
     void RememberLeavingDesktop()
     {
         var id=session.PreviousDesktop;
-        if(id==Guid.Empty||desktopRestorePending)return;
-        desktopFocus[id]=browsed.Where(Native.IsWindow).ToArray();
-        var focusRank=new Dictionary<nint,int>();
-        int rank=1;
-        foreach(var h in browsed)if(!IsPinned(h)&&Native.IsWindow(h))focusRank[h]=rank++;
-        var snap=new Dictionary<nint,DesktopWindowState>();
-        int z=0;
-        foreach(var w in catalog.Enumerate(true))
-        {
-            if(!DesktopArrangement.Include(IsPinned(w.Handle)))continue;
-            Guid owner;
-            try{owner=desktops.WindowDesktop(w.Handle);}catch{continue;}
-            if(owner!=id)continue;
-            var placement=new Native.WINDOWPLACEMENT{Length=System.Runtime.InteropServices.Marshal.SizeOf<Native.WINDOWPLACEMENT>()};
-            if(!Native.GetWindowPlacement(w.Handle,ref placement))continue;
-            Native.RECT bounds=default;
-            bool screenBounds=!Native.IsIconic(w.Handle)&&!Native.IsZoomed(w.Handle)
-                &&Native.GetWindowRect(w.Handle,out bounds)&&bounds.Width>0&&bounds.Height>0
-                &&!Native.IsMinimizedChrome(bounds,placement.NormalPosition);
-            // A thumbnail restore un-minimizes the HWND behind the overview. The desktop
-            // still remembers that this window was minimized, so the live show-state is
-            // not the one to save.
-            int show=placement.ShowCmd;
-            if(session.IsMinimizedDocked(w.Handle)&&show is not (2 or 6 or 7))show=2;
-            bool hasTile=session.TryGetCanvasCell(w.Handle,out var tile);
-            int focusOrder=focusRank.GetValueOrDefault(w.Handle);
-            snap[w.Handle]=new DesktopWindowState(bounds,show,session.IsDocked(w.Handle),session.IsMinimizedDocked(w.Handle),focusOrder>0,focusOrder,tile,hasTile,z++,placement.NormalPosition,screenBounds);
-        }
-        var previous=desktopStates.GetValueOrDefault(id) ?? new Dictionary<nint,DesktopWindowState>();
-        desktopStates[id]=DesktopArrangement.MergeSnapshots(previous,snap,h=>
-        {
-            if(!Native.IsWindow(h)||IsPinned(h))return false;
-            var owner=desktops.WindowDesktop(h);
-            return owner==id || owner==Guid.Empty; // Unknown during a shell transition is not deletion.
-        });
-        Log.Write($"[desktop] remembered {id} windows={snap.Count} focused={string.Join(",",focusRank.OrderBy(p=>p.Value).Select(p=>p.Key))}");
+        if(id!=Guid.Empty)desktopFocus[id]=browsed.Where(Native.IsWindow).ToArray();
     }
-    void RecallArrivingDesktop()
+    // Native HWND placement and show state already belong to Windows. Restore
+    // only which sources StayView presents full-size; no ShowWindow, placement
+    // replay, forced focus, desktop transfer, or second layout pass.
+    void PresentArrivingDesktop()
     {
-        var id=desktops.Current;
-        if(id==Guid.Empty)return;
-        if(!desktopStates.TryGetValue(id,out var remembered))remembered=[];
-        // Never restore a closed HWND or a window explicitly moved elsewhere.
-        var snap=remembered.Where(p=>Native.IsWindow(p.Key)&&!IsPinned(p.Key)
-            && desktops.WindowDesktop(p.Key)==id).ToDictionary(p=>p.Key,p=>p.Value);
-        // Dock membership is live and global for the entire overview session.
-        // A saved per-desktop snapshot may predate an explicit dock/undock, or
-        // omit a temporarily cloaked window. Reapplying its Docked flag here
-        // undocked the user's windows when switching desktops (notably Claude).
-        // Only DockTile/UndockTile and explicit minimize actions change membership.
-        foreach(var (h,s) in snap)
-        {
-            if(!Native.IsWindow(h)||IsPinned(h))continue;
-            if(session.IsDocked(h))continue; // Never restore a docked HWND full-size.
-            RestoreRememberedWindow(h,s);
-            if(s.HasTile)session.MoveTile(h,s.Tile);
-        }
-        // Restoring a minimized show-state puts the iconic frame back. Bring the real
-        // window up behind the overview so its tile is not that minimized border.
-        session.RestoreMinimizedSourcesForOverview();
-        session.Reflow();
-        RaisePinsAboveOthers();
-        RestoreDesktopFocus(id,snap);
-        Log.Write($"[desktop] restored {id} windows={snap.Count}");
-    }
-    // Windows that were in front on this desktop come back in front, in the same order.
-    // Everything else stays a tile. Pinned windows are not part of this memory.
-    void RestoreDesktopFocus(Guid id,Dictionary<nint,DesktopWindowState> snap)
-    {
-        var remembered=desktopFocus.GetValueOrDefault(id)
-            ?? snap.OrderBy(p=>p.Value.FocusOrder).Where(p=>p.Value.FocusOrder>0).Select(p=>p.Key).ToArray();
+        var id=session.ObservedDesktop;
+        var remembered=desktopFocus.GetValueOrDefault(id) ?? Array.Empty<nint>();
         var focused=DesktopArrangement.FocusOnArrival(remembered,CurrentPinned(),
             h=>CanBrowse(h)&&!IsTilePin(h)&&!session.IsDocked(h),MaxBrowsed);
         browsed.Clear();browsed.AddRange(focused);
         browsing=focused.Count>0;input.Browsing=browsing;
+        session.SelectForPresentation(focused.FirstOrDefault());
         canvasForegroundSince=0;gridReturnForeground=0;
-        PublishBrowsed();
-        if(focused.Count==0)
-        {
-            foreach(var chrome in overlays.Values)chrome.RaiseTopmost();
-            var foreground=Native.GetForegroundWindow();
-            var root=foreground==0?0:Native.GetAncestor(foreground,3);
-            if(CanBrowse(root))
-                Native.ForceForeground(overlays.GetValueOrDefault(Native.MonitorFromWindow(root,2),primary).Handle);
-            return;
-        }
-        Log.Write($"[desktop] restore-focus {string.Join(",",focused)}");
-        if(IsPinned(focused[0]))GivePinnedKeyboardFocus(focused[0]);
-        else EnterBrowsing(focused[0]);
-    }
-    bool WindowShouldStayMinimized(nint h)
-    {
-        var id=desktops.Current;
-        return id!=Guid.Empty && desktopStates.TryGetValue(id,out var snap) && snap.TryGetValue(h,out var state) && state.ShowCmd is 2 or 6 or 7;
-    }
-    void RestoreRememberedWindow(nint h,DesktopWindowState s)
-    {
-        if(!DesktopArrangement.RestoreWindow(h,s))Log.Write($"[desktop] placement restore declined {h}");
-    }
-    void RestorePinsForCurrentDesktop()
-    {
-        if(!session.Active)return;
-        PrunePins(true);
-        Log.Write($"[desktop] restore-pins current={CurrentPinned().Count}/{pinnedWindows.Count} fg={Native.GetForegroundWindow()}");
-        // Z-order only. Location and minimized/maximized status are restored separately
-        // and must not be rewritten just because the desktop changed.
-        RaisePinsAboveOthers();
+        // Shell foreground events during the handoff are observations. Retain
+        // this desktop's full-size/grid choice until the next user interaction.
+        desktopPresentationInteraction=input.InteractionVersion;
+        Log.Write($"[desktop] presented {id} full-size={focused.Count} docked={session.DockedSources.Count}");
     }
     List<Native.RECT> PinRects()
     {
@@ -544,7 +436,14 @@ sealed class TrayApp
                 if(Native.IsWindowVisible(chrome.Handle)&&!Native.IsIconic(h)&&(Native.GetWindowLongPtr(chrome.Handle,-20).ToInt64()&8)!=0
                     &&Native.IsAbove(chrome.Handle,h)&&pinBuriedLogged.Add(h))
                     Log.Write($"[pin] {h} was below overlay {chrome.Handle}; fg={Native.GetForegroundWindow()} browsing={browsing} activating={activating} popoutInteracting={popout?.IsInteracting==true}");
-            Native.SetWindowPos(h,(nint)(-1),0,0,0,0,0x13|0x4000);
+            // Avoid churning z-order when a pin already sits over the foreground.
+            // Repeatedly raising it can make focused windows visibly wobble.
+            var foreground = Native.GetForegroundWindow();
+            bool buried = overlays.Values.Any(chrome => Native.IsWindowVisible(chrome.Handle)
+                && Native.IsAbove(chrome.Handle,h));
+            if ((Native.GetWindowLongPtr(h,-20).ToInt64()&8)==0 || buried
+                || (foreground!=0 && foreground!=h && Native.IsAbove(foreground,h)))
+                Native.SetWindowPos(h,(nint)(-1),0,0,0,0,0x13|0x4000);
         }
         if(pinBuriedLogged.Count>0&&Environment.TickCount64-pinBuriedReset>5000){pinBuriedLogged.Clear();pinBuriedReset=Environment.TickCount64;}
         optionsWindow?.BringToFront();
@@ -579,7 +478,7 @@ sealed class TrayApp
         if(!session.Active||h==0)return;
         PlaceClearOfPins(h);
         if(!session.UndockTile(h))return;
-        if(settings.NativeWindowControls){EnterBrowsing(h);return;}
+        if(settings.NativeWindowControls){EnterBrowsing(h,userInitiated:true);return;}
         if(session.TryGetCanvasCell(h,out var cell))
         {
             var pins=PinRects();
@@ -737,7 +636,6 @@ sealed class TrayApp
         input.IsOverviewWindow=IsStayViewWindow;
         input.OverviewPinTarget=PinTargetAt;
         session.IsPinnedWindow=IsPinned;
-        session.KeepMinimized=WindowShouldStayMinimized;
         // Focused windows are kept off the desktop bar while the overview shows it.
         session.StripBarFor=monitor=>overlays.TryGetValue(monitor,out var chrome)&&Native.IsWindowVisible(chrome.Handle)
             ?chrome.StripBarBounds:default;
@@ -752,13 +650,13 @@ sealed class TrayApp
             int transition=session.DesktopTransitionVersion;
             long interaction=input.InteractionVersion;
             queue.TryEnqueue(async () => {
-                if(!session.Active||desktopRestorePending||transition!=session.DesktopTransitionVersion||!CanBrowse(h))return;
+                if(!session.Active||transition!=session.DesktopTransitionVersion||!CanBrowse(h))return;
                 StopFocusedDragWatch();
                 if(TryDockFocusedDrag(h,releasedAt))return;
                 // Win+drag posts cross-thread moves. Let the last posted move reach the app
                 // before capturing it; native caption moves use EVENT_SYSTEM_MOVESIZEEND below.
                 await Task.Delay(80);
-                if(session.Active && !desktopRestorePending && transition==session.DesktopTransitionVersion
+                if(session.Active && transition==session.DesktopTransitionVersion
                     && interaction==input.InteractionVersion && !input.IsDragging && CanBrowse(h))session.NoteUserMoved(h);
             });
         };
@@ -767,7 +665,7 @@ sealed class TrayApp
           Native.GetCursorPos(out var releasedAt);
           int transition=session.DesktopTransitionVersion;
           queue.TryEnqueue(() => {
-            if(!session.Active||desktopRestorePending||transition!=session.DesktopTransitionVersion||!CanBrowse(h))return;
+            if(!session.Active||transition!=session.DesktopTransitionVersion||!CanBrowse(h))return;
             if(IsPinned(h))
             {
                 // A pinned window does not move: end Windows' move/size loop the moment it
@@ -817,15 +715,27 @@ sealed class TrayApp
             // Read now, not in the queued turn: the user's own minimize is pressed on the
             // window that has the foreground at the moment the minimize starts.
             var foregroundAtEvent=Native.GetForegroundWindow();
-            queue.TryEnqueue(() => OnMinimizeChanged(h,started,foregroundAtEvent));
+            int transition=session.DesktopTransitionVersion;
+            queue.TryEnqueue(() => {
+                if(transition==session.DesktopTransitionVersion)OnMinimizeChanged(h,started,foregroundAtEvent);
+            });
         };
         emptySpace.Warm();
-        input.Toggle += () => queue.TryEnqueue(HotkeyToggle);
+        input.Toggle += () => queue.TryEnqueue(HotkeyToggleWithBanner);
         input.PinToggle += h => queue.TryEnqueue(()=>TogglePin(h));
+        FocusRequest? taskbarRequest=null;
+        int taskbarTransition=0;
+        input.TaskbarPressed += () => {
+            // Capture at press, before Windows can switch desktops. Never query
+            // the cross-process shell broker from the low-level mouse hook.
+            taskbarRequest=new FocusRequest(activationVersion,input.InteractionVersion,session.ObservedDesktop);
+            taskbarTransition=session.DesktopTransitionVersion;
+        };
         input.TaskbarInvoked += previous => {
-            int revision=activationVersion, transition=session.DesktopTransitionVersion;
-            long interaction=input.InteractionVersion;
-            queue.TryEnqueue(()=>FollowTaskbarActivation(previous,revision,interaction,transition));
+            var request=taskbarRequest;
+            int transition=taskbarTransition;
+            taskbarRequest=null;
+            if(request is { } pressed)queue.TryEnqueue(()=>FollowTaskbarActivation(previous,pressed,transition));
         };
         input.ClientDoubleClick += (h, first, second, gesture) => queue.TryEnqueue(async () =>
         {
@@ -856,16 +766,14 @@ sealed class TrayApp
             bool wasActive=session.Active;
             session.Exit();
             // Esc leaves Taskview++: show the banner as it goes (cosmetic, never blocks).
-            if(wasActive)
-                try{new SplashWindow().ShowPassiveAndFade();}
-                catch(Exception ex){Log.Write("Esc banner failed: "+ex.Message);}
+            if(wasActive)ShowBanner("Esc");
         });
         input.DesktopDirection += direction => queue.TryEnqueue(() => {
             var list = desktops.List(); int i = list.ToList().FindIndex(d => d.Current) + direction;
             if (i >= 0 && i < list.Count) session.ChangeDesktop(() => desktops.Switch(list[i].Id));
         });
         WireOverlay(primary);
-        primary.ToggleRequested += () => queue.TryEnqueue(HotkeyToggle);
+        primary.ToggleRequested += () => queue.TryEnqueue(HotkeyToggleWithBanner);
         primary.TrayMessage += message => {
             if (message == 0x202) HotkeyToggle();
             else if (message == 0x205) {
@@ -880,8 +788,7 @@ sealed class TrayApp
                     chrome = overlays.Count == 0 ? primary : NewOverlay();
                     overlays[monitor] = chrome;
                 }
-                chrome.Render(monitor, tiles, input.HotkeyText);
-                if(browsing)chrome.SetBrowsed(browsed,PinnedSet());
+                chrome.Render(monitor, tiles, input.HotkeyText,browsed,PinnedSet());
             }
             // Save state: dock/pin restores wait for a rendered overview. Queued, not called
             // here: docking reflows, which would re-enter this handler.
@@ -898,40 +805,23 @@ sealed class TrayApp
             signature = TopologySignature();
         };
         session.DesktopRemoved += id => {
-            desktopStates.Remove(id);desktopFocus.Remove(id);
+            desktopFocus.Remove(id);
             if(popout?.DesktopId==id)ClosePopout();
             var current=desktops.Current;
             foreach(var h in pinnedWindows.Where(p=>p.Value.HomeDesktop==id).Select(p=>p.Key).ToList())
                 pinnedWindows[h]=pinnedWindows[h] with {HomeDesktop=current};
         };
-        session.Leaving += () => { desktopRestoreVersion++; desktopRestorePending=false; desktopStates.Clear(); desktopFocus.Clear(); RecordLayout(); SaveOnOverviewClosed(); activationVersion++; activating=false; CancelAnimations(); nativeGestures.Clear(); overviewMinimizing.Clear(); ClosePopout(); CloseOptions(); browsing = false; ClearBrowsed(); ReleaseAllPins(); pinnedWindows.Clear(); pinRestoring.Clear(); pinSnapBacks.Clear(); input.Browsing = false; input.SetOverview(false); foreach (var chrome in overlays.Values) chrome.Hide(); signature = ""; };
-        // A desktop switch while browsing ends the browse: the focused window is on the
-        // desktop we left. Clear the flags only — the switch's own reflow renders the new
-        // grid, and with browsedSource cleared that render re-asserts the overview topmost.
+        session.Leaving += () => { desktopPresentationInteraction=-1; desktopFocus.Clear(); RecordLayout(); SaveOnOverviewClosed(); activationVersion++; activating=false; CancelAnimations(); nativeGestures.Clear(); overviewMinimizing.Clear(); ClosePopout(); CloseOptions(); browsing = false; ClearBrowsed(); ReleaseAllPins(); pinnedWindows.Clear(); pinRestoring.Clear(); pinSnapBacks.Clear(); input.Browsing = false; input.SetOverview(false); foreach (var chrome in overlays.Values) chrome.Hide(); signature = ""; };
+        // One presentation change at the desktop boundary. Keep the departing
+        // native windows intact and install the arriving browse state before Render.
         session.DesktopSwitched += () => {
-            Log.Write($"[desktop] switched -> {desktops.Current}; pins={pinnedWindows.Count} browsing={browsing} browsed={string.Join(",",browsed)}");
             RememberLeavingDesktop();
-            SuspendDepartingPins();
-            SyncPopoutForDesktop();
-            // A first activation can still be retrying before browsing becomes true.
-            // Invalidate it on every desktop switch, even in that pre-commit state.
-            browsing = false; input.Browsing = false; activating = false; activationVersion++;
-            CancelAnimations(); nativeGestures.Clear(); nativeGestureOrigins.Clear(); overviewMinimizing.Clear();
+            activationVersion++;activating=false;
+            CommitAnimations();nativeGestures.Clear();nativeGestureOrigins.Clear();overviewMinimizing.Clear();
             StopFocusedDragWatch();
-            tileDragInteraction=false; refrontAfterCanvasGesture=false;
-            ClearBrowsed();
-            // DesktopSwitched is raised before OverviewSession reflows the new desktop.
-            // Send any pin that was carried off its home desktop back there first, so
-            // the new grid does not adopt it as one of its own windows.
-            PrunePins(true);
-            int restoreVersion=++desktopRestoreVersion;
-            var arrival=desktops.Current;
-            desktopRestorePending=true;
-            queue.TryEnqueue(() => {
-                if(!session.Active||restoreVersion!=desktopRestoreVersion||desktops.Current!=arrival)return;
-                try { RestorePinsForCurrentDesktop();RecallArrivingDesktop(); }
-                finally { if(restoreVersion==desktopRestoreVersion)desktopRestorePending=false; }
-            });
+            tileDragInteraction=false;refrontAfterCanvasGesture=false;
+            PresentArrivingDesktop();
+            SyncPopoutForDesktop();
         };
         catalog.ForegroundChanged += () => queue.TryEnqueue(() => {
             if(!session.Active) return;
@@ -951,7 +841,13 @@ sealed class TrayApp
                 { RaisePinsAboveOthers(); return; }
             }
             if(session.ObserveDesktopChange())return;
-            if(activating||desktopRestorePending) return;
+            if(activating) return;
+            if(PreserveDesktopPresentation)
+            {
+                foreach(var chrome in overlays.Values)
+                    if(browsing)chrome.ReassertBrowseZOrder();else chrome.KeepAbove();
+                return;
+            }
             PrunePins();
             // OS-level desktop switches do not raise OverviewSession.DesktopSwitched.
             // Synchronize before any z-order work so a pinned popout representing the new
@@ -978,7 +874,7 @@ sealed class TrayApp
             // Opening a popped-out desktop must not reflow, refocus, or move the
             // windows on the desktop the user is already looking at.
             if(preserveWindowState)return;
-            if(session.ObserveDesktopChange()||desktopRestorePending)return;
+            if(session.ObserveDesktopChange())return;
             // Keep this ahead of all interaction early-outs. A Win+Ctrl+Arrow / Task View
             // switch must hide or restore the pinned popout even during browse/drag state.
             SyncPopoutForDesktop();
@@ -991,7 +887,8 @@ sealed class TrayApp
             // moved, resized, maximized or snapped by the user.
             if (browsing)
             {
-                foreach (var b in browsed.Where(b=>!IsPinned(b)&&!nativeGestures.Contains(b)).ToList()) session.SyncUserGeometry(b);
+                if(!PreserveDesktopPresentation)
+                    foreach (var b in browsed.Where(b=>!IsPinned(b)&&!nativeGestures.Contains(b)).ToList()) session.SyncUserGeometry(b);
                 // ReconcileBrowse deliberately leaves active pointer/native move gestures
                 // alone. Maintain only browse z-order during that pause so a focused
                 // window cannot sit hidden behind the overview until release.
@@ -1001,9 +898,8 @@ sealed class TrayApp
             }
             if (browsing || activating || session.DragActive || overlays.Values.Any(c => c.IsDragging) || popout?.IsInteracting == true) return;
             try {
-                // A window minimized while the grid is open can lose its DWM pixels and
-                // look like a glowing ghost tile. Restore such sources behind the overview
-                // before refreshing any live desktop/thumbnail composition.
+                // Refresh live previews only for sources explicitly authorized on this
+                // desktop visit. Arrival itself never restores minimized windows.
                 session.RestoreMinimizedSourcesForOverview();
                 popout?.Refresh();
                 optionsWindow?.BringToFront();
@@ -1111,7 +1007,7 @@ sealed class TrayApp
         chrome.FloatingPanel = popout?.Handle ?? 0;
         // Tile events already run on the UI thread. Keep activation attached to the
         // selection click instead of deferring it behind unrelated focus messages.
-        chrome.TileActivated += EnterBrowsing;
+        chrome.TileActivated += h => EnterBrowsing(h,userInitiated:true);
         chrome.DockedTileClicked += RevealDockedWindow;
         chrome.InteractionStarted += () => {
             if(activating)
@@ -1284,7 +1180,7 @@ sealed class TrayApp
                 activating = false;
                 if (session.Active)
                 {
-                    if (picker != 0) EnterBrowsing(picker);
+                    if (picker != 0) EnterBrowsing(picker,userInitiated:true);
                     // Nothing to browse: put the overview back the way it was.
                     else if (!browsing) { ClearBrowsed(); foreach (var chrome in overlays.Values) chrome.RaiseTopmost(); }
                 }
@@ -1314,7 +1210,7 @@ sealed class TrayApp
     // resident; the hotkey re-summons the grid.
     bool AdoptForeground(nint h, bool restoreDocked = false)
     {
-        if(!session.Active||desktopRestorePending||!CanBrowse(h))return false;
+        if(!session.Active||!CanBrowse(h))return false;
         if(!session.Placements.Entries.ContainsKey(h))session.Reflow();
         if(!session.Activate(h,requestForeground:false,restoreDocked:restoreDocked))return false;
         activationVersion++;activating=false;CancelAnimations();
@@ -1326,17 +1222,15 @@ sealed class TrayApp
         Log.Write($"[browse] adopted foreground {h}");
         return true;
     }
-    async void FollowTaskbarActivation(nint previous, int revision, long interaction, int transition)
+    async void FollowTaskbarActivation(nint previous, FocusRequest request, int transition)
     {
-        var desktop=desktops.Current;
-        var request=new FocusRequest(revision,interaction,desktop);
         // Windows owns launch/restore/minimise and group selection. Adopt only
         // the window it actually activates, without launching or moving it.
         for(int attempt=0;attempt<6;attempt++)
         {
             await Task.Delay(35);
             if(!request.IsCurrent(activationVersion,input.InteractionVersion,desktops.Current,session.Active)
-                || session.DesktopTransitionVersion!=transition || desktopRestorePending
+                || session.DesktopTransitionVersion!=transition
                 || session.ObserveDesktopChange())return;
             var fg=Native.GetForegroundWindow();
             var root=fg==0?0:Native.GetAncestor(fg,3);
@@ -1347,10 +1241,11 @@ sealed class TrayApp
                 && AdoptForeground(window.Handle,restoreDocked:true))return;
         }
     }
-    async void EnterBrowsing(nint h)
+    async void EnterBrowsing(nint h,bool userInitiated=false)
     {
         Log.Write($"[browse] enter {h} pinned={IsPinned(h)} stable={IsCurrentDesktopStable(h)} active={session.Active}");
         if (!session.Active || h==0 || !Native.IsWindow(h) || (!IsPinned(h)&&!IsCurrentDesktopStable(h))) return;
+        if(!userInitiated && (session.IsDocked(h)||session.IsMinimizedDocked(h)))return;
         // A pin does not expand or take focus. Right-hold is what releases it.
         if(!PinnedWindowPolicy.CanFocus(IsPinned(h))){Log.Write($"[browse] pinned {h} stays put");return;}
         var activationDesktop=desktops.Current;
@@ -1374,10 +1269,14 @@ sealed class TrayApp
                 // covering the HWND, then measure the actual DWM frame for a snap-free
                 // expansion. The window then expands over its tile, not from wherever it
                 // last sat on the desktop.
-                session.PrepareActivationGeometry(h);
-                session.CenterOverTile(h);
-                if(!settings.NativeWindowControls && !IsPinned(h))PlaceClearOfPins(h);
-                session.EnsureActivationTopVisible(h);
+                // A focus click does not express an intent to move the window.
+                // Apply only an explicit prior miniature drag; keep the real HWND
+                // where the user left it, including across desktop round trips.
+                if(userInitiated)
+                {
+                    session.PrepareActivationGeometry(h);
+                    session.EnsureActivationTopVisible(h);
+                }
                 if(!settings.NativeWindowControls)
                     await AnimateWindowsAsync(WindowBounds(new[]{h}),true);
             }
@@ -1388,7 +1287,7 @@ sealed class TrayApp
             {
                 if(!request.IsCurrent(activationVersion,input.InteractionVersion,desktops.Current,session.Active))return;
                 if(!Native.IsWindow(h) || (!IsPinned(h)&&!IsCurrentDesktopStable(h)))break;
-                if(session.Activate(h))
+                if(session.Activate(h,restoreDocked:userInitiated))
                 {
                     browsing=true;
                     input.Browsing=true;
@@ -1430,20 +1329,28 @@ sealed class TrayApp
         }
         session.Toggle();
     }
-    // The single authority for browse state. Called on every foreground change AND every
-    // timer tick, so however the world drifts — a window focused directly, the desktop
-    // switched (by StayView or Windows), a window closed or moved away — StayView's browse
-    // state is reconciled against what is actually in front, within one tick at worst.
-    // Browsing is valid ONLY while the selected window is the real foreground window on the
-    // current desktop; anything else resolves to following the new foreground source or,
-    // failing that, returning to the grid so no window is ever left hidden with the
-    // overview dropped behind it.
-    // A closing window exposes the canvas and is gone within one timer tick (500 ms).
+    // Ctrl+Win+Space entering or leaving Taskview++ shows the banner as it goes. Returning
+    // focused windows to the grid keeps the overview open, so it shows no banner.
+    void HotkeyToggleWithBanner()
+    {
+        bool wasActive=session.Active;
+        HotkeyToggle();
+        if(session.Active!=wasActive)ShowBanner("Hotkey");
+    }
+    // The banner is cosmetic and passive (no focus change); it never blocks.
+    static void ShowBanner(string reason)
+    {
+        try{new SplashWindow().ShowPassiveAndFade();}
+        catch(Exception ex){Log.Write(reason+" banner failed: "+ex.Message);}
+    }
+    // Reconcile foreground changes after user input. Immediately after a desktop
+    // switch, retain that desktop's remembered presentation until new input arrives;
+    // incidental shell focus must not expand, shrink or restore its windows.
     const long CanvasSettleMs=300;
     long canvasForegroundSince;
     void ReconcileBrowse()
     {
-        if(!browsing || !session.Active || activating || desktopRestorePending || session.ObserveDesktopChange()) return;
+        if(!browsing || !session.Active || activating || session.ObserveDesktopChange() || PreserveDesktopPresentation) return;
         if(session.DragActive || input.IsDragging || nativeGestures.Count!=0 || overlays.Values.Any(c => c.IsDragging)) return; // never interrupt a gesture
         var minimizedPins=browsed.Where(h=>IsPinned(h)&&Native.IsIconic(h)).ToList();
         foreach(var h in pinRestoreSince.Keys.Where(h=>!minimizedPins.Contains(h)).ToList())pinRestoreSince.Remove(h);

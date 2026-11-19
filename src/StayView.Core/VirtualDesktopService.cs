@@ -30,7 +30,7 @@ internal sealed class DirectVirtualDesktopService
     }
     void Connect() {
         // This ABI is deliberately gated. Unknown builds use the documented current-desktop API.
-        if(Environment.OSVersion.Version.Build is <26100 or >26200)return;
+        if(!DesktopBuildSupport.IsSupported(Environment.OSVersion.Version.Build))return;
         try {
             var shell=(IShellServices)Activator.CreateInstance(Type.GetTypeFromCLSID(new("C2F03A33-21F5-47FA-B4BB-156362A2F239"))!)!;
             var sid=new Guid("C5E0CDCA-7B6E-41B2-9FC4-D93975CC467B");var iid=typeof(IDesktopManager).GUID;

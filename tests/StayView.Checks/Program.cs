@@ -1,7 +1,7 @@
 using StayView.Core;
 using System.Text.Json;
 Fixtures.SetProcessDpiAwarenessContext(-4);
-if(args.Length>0&&args[0]=="dock-activation-review"){await Fixtures.CheckPassiveDockActivation();return;}
+if(args.Length>0&&args[0]=="dock-activation-review"){await Fixtures.CheckPassiveDockActivation();await Fixtures.CheckForeignDockReentry();await Fixtures.CheckDesktopPresentation();return;}
 var options=new JsonSerializerOptions{IncludeFields=true,WriteIndented=true};
 if(args.Length>0&&args[0]=="stayview-windows"){
     int z=0;
@@ -16,6 +16,7 @@ if(args.Length>0&&args[0]=="stayview-windows"){
 }
 if(args.Length>0&&args[0]=="fixtures"){Fixtures.Run();return;}
 if(args.Length>0&&args[0]=="interaction-checks"){await InteractionChecks.Run();return;}
+if(args.Length>0&&args[0]=="focus-stability-checks"){await InteractionChecks.Run(focusOnly:true);return;}
 if(args.Length>0&&args[0]=="desktop-grid-checks"){await InteractionChecks.Run(nativeOnly:true,desktopOnly:true,gridOnly:true);return;}
 if(args.Length>0&&args[0]=="desktop-focus-checks"){await InteractionChecks.Run(nativeOnly:true,desktopOnly:true);return;}
 if(args.Length>0&&args[0]=="native-interaction-checks"){await InteractionChecks.Run(nativeOnly:true);return;}
@@ -111,7 +112,7 @@ int checks=0;
 }
 var defaults=new Settings();if(!defaults.DockEnabled||defaults.DockPosition!=DockPosition.Auto||defaults.SatelliteScale!=25||!defaults.DockMinimizedWindows)throw new Exception("Dock defaults");
 if(defaults.GlassOpacity!=65||!defaults.UseSameChromeOpacity||defaults.DockOpacity!=55||defaults.DesktopStripOpacity!=55||defaults.ReduceBlur)throw new Exception("Appearance defaults");
-if(defaults.DesktopStripPosition!=DesktopStripPosition.Top||!defaults.KeepMinisSameSize||defaults.AutoArrange||defaults.AutoArrangeGrid!=4||!defaults.AnimateLayout||defaults.DesktopTransition!=DesktopTransitionMode.Slide||defaults.BackgroundTheme!=BackgroundTheme.DarkBlueBlack||defaults.SmallWindowSize!=Settings.SmallWindowSizeDefault||Settings.SmallWindowSizeDefault!=700)throw new Exception("Strip/options defaults");
+if(defaults.DesktopStripPosition!=DesktopStripPosition.Top||!defaults.KeepMinisSameSize||defaults.AutoArrange||defaults.AutoArrangeGrid!=4||!defaults.AnimateLayout||defaults.DesktopTransition!=DesktopTransitionMode.Appear||defaults.BackgroundTheme!=BackgroundTheme.DarkBlueBlack||defaults.SmallWindowSize!=Settings.SmallWindowSizeDefault||Settings.SmallWindowSizeDefault!=700)throw new Exception("Strip/options defaults");
 if(!defaults.DockOnBarContact)throw new Exception("Dock on bar contact should default on");
 if(!defaults.PlasmaEffect)throw new Exception("Plasma effect should default on");
 if(Settings.SmallWindowSizeMin>=defaults.SmallWindowSize||Settings.SmallWindowSizeMax<=defaults.SmallWindowSize)throw new Exception("Custom thumbnail slider range");

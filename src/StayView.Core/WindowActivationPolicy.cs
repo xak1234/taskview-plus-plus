@@ -4,8 +4,8 @@ namespace StayView.Core;
 public static class WindowActivationPolicy
 {
     public static bool CanActivate(bool docked, bool minimizedDocked, bool pendingMinimize,
-        bool requestForeground, bool restoreDocked=false)
-        => requestForeground || restoreDocked || !(docked || minimizedDocked || pendingMinimize);
+        bool restoreDocked=false)
+        => restoreDocked || !(docked || minimizedDocked || pendingMinimize);
 
     public static bool IsNewTaskbarTarget(nint previous, nint current)
         => current!=0 && current!=previous;

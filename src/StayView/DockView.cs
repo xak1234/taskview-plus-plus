@@ -40,6 +40,12 @@ sealed class DockView : IDisposable
     // the inner edge while the ring remains visible around it. The actual foreground window
     // gets a substantially thicker ring than the other browsed window.
     readonly Dictionary<nint, Border> browseBorders = [];
+    // Reuse brushes and modify adornments only when their geometry or focus
+    // really changes; the location-event stream can run every pointer sample.
+    readonly SolidColorBrush browseActiveBrush = GlassAppearance.ActiveBrush();
+    readonly SolidColorBrush browseInactiveBrush = GlassAppearance.EdgeBrush();
+    readonly SolidColorBrush dockBlueBrush = new(Windows.UI.Color.FromArgb(245,30,70,150));
+    readonly SolidColorBrush dockWhiteBrush = new(Microsoft.UI.Colors.White);
     readonly Dictionary<nint, Border> pinDots = [];
     readonly DispatcherTimer pinHoldTimer = new() { Interval = TimeSpan.FromMilliseconds(900) };
     // Frame-locked (see FrameTimer): layout/desktop transitions, repel easing, drag work.
@@ -52,9 +58,6 @@ sealed class DockView : IDisposable
     // Neighbours easing out of (or back into) the way of a dragged tile.
     readonly FrameTimer repelTimer = new();
     readonly Dictionary<nint, TileMotion> repel = [];
-    // Real rectangle of each focused window at the moment a drag starts, so repulsion
-    // can slide that window by the same amount as its tile without jumping it small.
-    readonly Dictionary<nint, Native.RECT> browsedRepelOrigin = [];
     const double RepelDuration = 140;
     // Electric arcs between a dragged tile and the desktop/dock bar when they meet.
     readonly PlasmaEffect plasma;
@@ -84,9 +87,6 @@ sealed class DockView : IDisposable
     bool focusStandIn;
     Native.RECT focusOrigin;
     nint hoverSource;
-    // The iconic source hover last asked the session to restore, so it asks once per
-    // hover-entry rather than on every pointer-move sample.
-    nint hoverRestoreAsked;
     readonly HashSet<nint> suppressed = new();
     readonly HashSet<nint> presentedBrowsed = new();
     // Exact miniature rectangle captured immediately before a focus expansion. Shrink uses
@@ -100,7 +100,6 @@ sealed class DockView : IDisposable
     DragPhase dragPhase;
     // Built when a focused-window drag starts; keeps the real window off the desktop bar.
     Func<Native.RECT,Native.RECT>? focusDragClamp;
-    readonly Dictionary<nint,Func<Native.RECT,Native.RECT>?> repelClamps = [];
     bool pressedDocked, overStrip;
     nint pinHoldSource;
     uint pinHoldPointerId;
@@ -186,7 +185,7 @@ sealed class DockView : IDisposable
             TilePinToggle?.Invoke(pinHoldSource);
         };
     }
-    public void Render(IReadOnlyList<Tile> tiles, Native.RECT work, double scale, DesktopTransitionMode transition=DesktopTransitionMode.Appear)
+    public void Render(IReadOnlyList<Tile> tiles, Native.RECT work, double scale, DesktopTransitionMode transition=DesktopTransitionMode.Appear,bool desktopSwitch=false)
     {
         // Preserve the last COMPOSITED rectangles before the reflow rewrites Cell/Docked.
         // In particular, clicking a docked mini calls UndockTile -> Reflow; without this
@@ -194,10 +193,9 @@ sealed class DockView : IDisposable
         // layout has no dock-side origin to animate from.
         var previous = items.ToDictionary(i => i.Source, i => (i.Docked, i.VisualCell));
         this.work = work; this.scale = scale;
-        // The desktop switch renders once to start the delivery, then the queued
-        // window restore renders again. That second pass used to snap every tile
-        // to its final cell before the first animation frame, so the change looked instant.
-        bool continuing=transition==DesktopTransitionMode.Appear && transitionActive && transitionStarts.Count>0;
+        // An ordinary refresh can continue the current animation. A desktop
+        // boundary discards the departing animation before presenting the new view.
+        bool continuing=!desktopSwitch && transition==DesktopTransitionMode.Appear && transitionActive && transitionStarts.Count>0;
         StopRepel();
         StopZoom();
         if(!continuing)StopTransition(false);
@@ -224,17 +222,29 @@ sealed class DockView : IDisposable
             item.Cell = tile.Cell; item.Docked = tile.Role == TileRole.Dock;
             Native.DwmQueryThumbnailSourceSize(item.Thumbnail,out item.SourceSize);
             if (item.Docked) docked.Add(item);
+            else if(presentedBrowsed.Contains(item.Source))
+            {
+                // An unrelated tile move or desktop reflow must never shrink a real
+                // browsed window's standby DWM image to its miniature cell. Keep the
+                // fallback at the actual HWND rectangle until the user demotes it.
+                transitionStarts.Remove(item.Source);
+                transitionTargets.Remove(item.Source);
+                dockDrops.Remove(item.Source);
+                if(!Native.IsIconic(item.Source) && Native.TryGetVisualBounds(item.Source,out var browsedFrame)
+                    && browsedFrame.Intersects(work))
+                    PositionRect(item,browsedFrame,PositionWriter.Layout);
+            }
             else if(continuing && transitionStarts.ContainsKey(item.Source))
             {
-                // Keep the thumbnail where the delivery currently has it. Only the
-                // landing cell may change, because the restore pass just repositioned it.
+                // Keep the thumbnail where the delivery currently has it. An ordinary
+                // refresh can change the landing cell without restarting its journey.
                 // A focus EXPAND lands on the real window, never on the tile: retargeting it
                 // turned the picture round and shrank it back mid-zoom.
                 item.Cell=tile.Cell;
                 if(transitionTargets.ContainsKey(item.Source) && !(focusTransition && focusExpanding))
                     transitionTargets[item.Source]=tile.Cell;
             }
-            else if(settings.AnimateLayout && hadPrevious && before.Docked &&
+            else if(!desktopSwitch && settings.AnimateLayout && hadPrevious && before.Docked &&
                     before.VisualCell.Width>0 && before.VisualCell.Height>0)
             {
                 // Undocking is a normal layout transition, not a desktop transition. Start
@@ -285,7 +295,9 @@ sealed class DockView : IDisposable
             }
             (onLeft ? leftItems : rightItems).Add(item);
         }
-        foreach (var gone in dockSide.Keys.Where(h => !docked.Any(d => d.Source == h)).ToList()) dockSide.Remove(gone);
+        // A cloaked dock HWND may miss a render pass during desktop switching.
+        // Its dock side belongs to the session membership, not this frame.
+        foreach (var gone in dockSide.Keys.Where(h => !session.IsDocked(h) || !Native.IsWindow(h)).ToList()) dockSide.Remove(gone);
         int dockGap = (int)Math.Round(20 * scale);
         int perLane = Math.Max(leftItems.Count, rightItems.Count);
         var leftSlots = ThumbnailLayout.DockLaneSlots(perLane, leftDock, dockGap, true);
@@ -295,7 +307,7 @@ sealed class DockView : IDisposable
             item.Cell = slot;
             // Just docked from the canvas: start at the pixels that were on screen (where the
             // tile was dropped) and drop into the bar (see DockDropRect), instead of snapping.
-            if (settings.AnimateLayout && !continuing && previous.TryGetValue(item.Source, out var was) && !was.Docked
+            if (!desktopSwitch && settings.AnimateLayout && !continuing && previous.TryGetValue(item.Source, out var was) && !was.Docked
                 && was.VisualCell.Width > 0 && was.VisualCell.Height > 0 && !was.VisualCell.Equals(slot))
             {
                 transitionStarts[item.Source] = was.VisualCell;
@@ -571,6 +583,7 @@ sealed class DockView : IDisposable
         if(finish)
             foreach(var item in items)
                 if(transitionStarts.ContainsKey(item.Source)
+                    && !presentedBrowsed.Contains(item.Source)
                     && (preserveVisual==null || !preserveVisual.ContainsKey(item.Source)))
                     Position(item,PositionWriter.Layout);
         transitionStarts.Clear();transitionActive=false;focusTransition=false;dockDrops.Clear();
@@ -599,16 +612,18 @@ sealed class DockView : IDisposable
             adornmentCanvas.Children.Add(frame);
             dockBorders[source]=frame;
         }
-        frame.BorderBrush=DockBorderBrush(source);
-        frame.Width = Math.Max(1, w); frame.Height = Math.Max(1, h);
+        var brush=DockBorderBrush(source);
+        if(!ReferenceEquals(frame.BorderBrush,brush))frame.BorderBrush=brush;
+        double targetWidth=Math.Max(1,w),targetHeight=Math.Max(1,h);
+        if(frame.Width!=targetWidth)frame.Width=targetWidth;
+        if(frame.Height!=targetHeight)frame.Height=targetHeight;
         MoveAdornment(frame,left,top);
-        frame.Visibility=ShouldShowDockBorder(source)?Visibility.Visible:Visibility.Collapsed;
+        var visibility=ShouldShowDockBorder(source)?Visibility.Visible:Visibility.Collapsed;
+        if(frame.Visibility!=visibility)frame.Visibility=visibility;
     }
     // Pinned docked windows get a white frame; every other docked window is standard blue.
     SolidColorBrush DockBorderBrush(nint source)
-        => session.IsPinned(source)
-            ? new SolidColorBrush(Microsoft.UI.Colors.White)
-            : new SolidColorBrush(Windows.UI.Color.FromArgb(245, 30, 70, 150));
+        => session.IsPinned(source) ? dockWhiteBrush : dockBlueBrush;
     bool ShouldShowDockBorder(nint source)
     {
         var item=items.FirstOrDefault(i=>i.Source==source);
@@ -741,8 +756,10 @@ sealed class DockView : IDisposable
     {
         foreach(var (source,frame) in dockBorders)
         {
-            frame.BorderBrush=DockBorderBrush(source);
-            frame.Visibility=ShouldShowDockBorder(source)?Visibility.Visible:Visibility.Collapsed;
+            var brush=DockBorderBrush(source);
+            if(!ReferenceEquals(frame.BorderBrush,brush))frame.BorderBrush=brush;
+            var visibility=ShouldShowDockBorder(source)?Visibility.Visible:Visibility.Collapsed;
+            if(frame.Visibility!=visibility)frame.Visibility=visibility;
         }
     }
     void RemoveDockBorder(nint source)
@@ -784,12 +801,15 @@ sealed class DockView : IDisposable
                 adornmentCanvas.Children.Add(frame);
                 browseBorders[source]=frame;
             }
-            frame.BorderThickness=new Thickness(thickness);
-            frame.BorderBrush=pinned||focused?GlassAppearance.ActiveBrush():GlassAppearance.EdgeBrush();
-            frame.Width=Math.Max(1,real.Width/scale+2*inset);
-            frame.Height=Math.Max(1,real.Height/scale+2*inset);
+            if(frame.BorderThickness.Left!=thickness)frame.BorderThickness=new Thickness(thickness);
+            var brush=pinned||focused?browseActiveBrush:browseInactiveBrush;
+            if(!ReferenceEquals(frame.BorderBrush,brush))frame.BorderBrush=brush;
+            double width=Math.Max(1,real.Width/scale+2*inset);
+            double height=Math.Max(1,real.Height/scale+2*inset);
+            if(frame.Width!=width)frame.Width=width;
+            if(frame.Height!=height)frame.Height=height;
             MoveAdornment(frame,(real.Left-work.Left)/scale-inset,(real.Top-work.Top)/scale-inset);
-            frame.Visibility=Visibility.Visible;
+            if(frame.Visibility!=Visibility.Visible)frame.Visibility=Visibility.Visible;
         }
     }
     void UpdatePinDots(IEnumerable<nint> browsedSources,IReadOnlySet<nint>? pinnedSources)
@@ -843,27 +863,13 @@ sealed class DockView : IDisposable
         // Tiles hidden under a zoomed dock preview get no glow.
         if (zoomCover is { } zc && Contains(zc, p)) { HideGlow(); hoverSource = 0; return; }
         var item = items.LastOrDefault(i => !suppressed.Contains(i.Source) && HitTile(i, p));
-        // If a source was minimized after its thumbnail was registered, DWM may leave
-        // an empty tile while this XAML glow still renders. Drop the glow immediately
-        // and ask the session to restore the real window behind the overview so the live
-        // thumbnail can resume instead of presenting a clickable "ghost" rectangle.
+        // A minimized source may retain only its last DWM frame. Hover is not a
+        // restore command: leave the native window alone until a deliberate click.
         if (item != null && Native.IsIconic(item.Source))
         {
             ClearHover();
-            // Ask ONCE per hover-entry, not on every pointer-move sample. A source that
-            // refuses to stay restored (e.g. a background updater that re-minimizes
-            // itself) otherwise turned this into a ~120/sec SetWindowPlacement storm that
-            // flapped the real window in and out behind the canvas. The 500 ms timer's
-            // RestoreMinimizedSourcesForOverview handles any periodic retry; hover only
-            // needs to kick it once when the pointer arrives on the ghost tile.
-            if (hoverRestoreAsked != item.Source)
-            {
-                hoverRestoreAsked = item.Source;
-                session.RestoreMinimizedSourceForOverview(item.Source);
-            }
             return;
         }
-        hoverRestoreAsked = 0;
         nint next = item?.Source ?? 0;
         if (next == hoverSource) return;
         hoverSource = next;
@@ -946,7 +952,7 @@ sealed class DockView : IDisposable
         StopTransition(true, item!=null && pressedVisual is {} hitRect
             ? new Dictionary<nint, Native.RECT>{{item.Source, hitRect}} : null);
         if(item!=null && pressedVisual is {} visible)PositionRect(item,visible,PositionWriter.Layout);
-        if(item!=null){repel.Remove(item.Source);repelClamps.Remove(item.Source);}
+        if(item!=null)repel.Remove(item.Source);
         // Middle-click a tile to close its window (replaces the old on-tile ✕ button).
         // A left click on the corner X painted in the thumbnail does the same, for
         // windows that actually have a caption. Borderless windows keep that corner.
@@ -1037,14 +1043,12 @@ sealed class DockView : IDisposable
             repel.Remove(dragSource);
             session.BeginTileDrag(dragSource);
             TileDragStarted?.Invoke();
-            CaptureRepelOrigins();
         }
         if(!settings.NativeWindowControls && focusStandIn && dragPhase==DragPhase.Pressed && PinnedWindowPolicy.CanDragTile(session.IsPinned(dragSource)) && !Native.IsZoomed(dragSource)
             && Math.Max(Math.Abs(p.X-pressed.X),Math.Abs(p.Y-pressed.Y))>=8)
         {
             dragPhase=DragPhase.Dragging;
             ClearHover();
-            CaptureRepelOrigins();
             focusDragClamp=session.StripClamp(dragSource);
         }
         if(focusStandIn && dragPhase==DragPhase.Dragging)
@@ -1160,7 +1164,6 @@ sealed class DockView : IDisposable
                     if(settings.RepelWindows)
                     {
                         session.CommitNeighbourRepel(source,lastDragRect);
-                        foreach(var id in browsedRepelOrigin.Keys)if(id!=source)session.NoteUserMoved(id);
                     }
                 }
                 else if(clicked && Math.Max(Math.Abs(lastPoint.X-pressed.X),Math.Abs(lastPoint.Y-pressed.Y))<8)
@@ -1170,14 +1173,9 @@ sealed class DockView : IDisposable
                         StayView.Core.Log.Write($"[pin] click on pinned {source} ignored");
                     else TileActivated?.Invoke(source);
                 }
-                browsedRepelOrigin.Clear();
             }
             else if(moved)
             {
-                // Remember focused windows that slid aside before the drop reflows.
-                // Pinned windows were never moved.
-                if(clicked&&settings.RepelWindows)
-                    foreach(var id in browsedRepelOrigin.Keys)session.NoteUserMoved(id);
                 var item=items.FirstOrDefault(i=>i.Source==source);
                 if(item!=null)
                 {
@@ -1222,7 +1220,6 @@ sealed class DockView : IDisposable
             session.EndTileDrag(source);
             pressedDocked=false;
             focusStandIn=false;
-            browsedRepelOrigin.Clear();
             dragSource=0; pointerId=0; dragPhase=DragPhase.Idle;
             canvas.ReleasePointerCapture(pointer);
             TileDragEnded?.Invoke();
@@ -1259,20 +1256,13 @@ sealed class DockView : IDisposable
         {
             // Pinned windows do not take notice: they stay where they were pinned.
             // The dragged window is the thing being held. Docked minis stay in the bar.
+            // Repulsion moves only unfocused miniatures. Browsed real windows stay
+            // exactly where the user put them while another window is dragged.
             if (item.Docked || item.Source == dragSource || session.IsPinned(item.Source)
-                || transitionTargets.ContainsKey(item.Source)) continue;
-            if(settings.NativeWindowControls && presentedBrowsed.Contains(item.Source))continue;
+                || presentedBrowsed.Contains(item.Source) || transitionTargets.ContainsKey(item.Source)) continue;
             if (suppressed.Contains(item.Source) && !presentedBrowsed.Contains(item.Source)) continue;
-            var toTile = targets.TryGetValue(item.Source, out var target) ? target : item.Cell;
-            Native.RECT to = toTile;
+            Native.RECT to = targets.TryGetValue(item.Source, out var target) ? target : item.Cell;
             Native.RECT from = item.VisualCell;
-            if (presentedBrowsed.Contains(item.Source))
-            {
-                // Slide the real window by the tile's shift. Putting the thumbnail on the
-                // small slot here is the jump the focused window must not make.
-                if (!browsedRepelOrigin.TryGetValue(item.Source, out var origin)) continue;
-                to = new Native.RECT(origin.Left + (toTile.Left - item.Cell.Left), origin.Top + (toTile.Top - item.Cell.Top), origin.Width, origin.Height);
-            }
             if(repel.TryGetValue(item.Source,out var running))
                 repel[item.Source]=running.Retarget(from,to,now);
             else if(!to.Equals(from))repel[item.Source]=new TileMotion(from,to,now);
@@ -1287,41 +1277,19 @@ sealed class DockView : IDisposable
             var item = items.FirstOrDefault(i => i.Source == source);
             if (item == null) { repel.Remove(source); continue; }
             if(source==dragSource || transitionTargets.ContainsKey(source)
-                || (settings.NativeWindowControls && presentedBrowsed.Contains(source)))
-            { repel.Remove(source);repelClamps.Remove(source);continue; }
+                || presentedBrowsed.Contains(source))
+            { repel.Remove(source);continue; }
             double t = Math.Clamp((now - started) / RepelDuration, 0, 1);
             var shown = Lerp(from, to, 1 - Math.Pow(1 - t, 3));
-            // A focused window is a real HWND and is not pushed into the desktop bar. Its
-            // clamp is built once per repel slide, not per frame.
-            bool real = presentedBrowsed.Contains(source);
-            if (real)
-            {
-                if (!repelClamps.TryGetValue(source, out var clamp)) repelClamps[source] = clamp = session.StripClamp(source);
-                if (clamp != null) shown = clamp(shown);
-            }
             PositionRect(item, shown, PositionWriter.Drag);
-            // Move the real window with its picture; a pin never reaches here.
-            if (real)
-                Native.SetWindowPos(source, 0, shown.Left, shown.Top, 0, 0, 0x15 | 0x4000);
-            if (t >= 1) { repel.Remove(source); repelClamps.Remove(source); }
+            if (t >= 1) repel.Remove(source);
         }
-        if (repel.Count == 0) { repelTimer.Stop(); repelClamps.Clear(); }
+        if (repel.Count == 0) repelTimer.Stop();
     }
     void StopRepel()
     {
         repelTimer.Stop();
-        repel.Clear(); repelClamps.Clear();
-        browsedRepelOrigin.Clear();
-    }
-    void CaptureRepelOrigins()
-    {
-        browsedRepelOrigin.Clear();
-        foreach (var item in items)
-        {
-            if (!presentedBrowsed.Contains(item.Source) || item.Source == dragSource || session.IsPinned(item.Source)) continue;
-            if (Native.GetWindowRect(item.Source, out var rect) && rect.Width > 0 && rect.Height > 0) browsedRepelOrigin[item.Source] = rect;
-            else browsedRepelOrigin[item.Source] = item.VisualCell;
-        }
+        repel.Clear();
     }
     // The dragged tile is held off the bar by the no-drop gap. As its edge nears that limit
     // arcs start to jump the gap; pressing past it (the tile stays put, the pointer does

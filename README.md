@@ -6,6 +6,13 @@ Taskview++ takes the idea of Windows Task View and turns it into a persistent wo
 
 > **Beta test release:** Taskview++ is currently public beta software. It is being shared for testing and feedback, and behavior, compatibility, settings, and features may still change before a stable release.
 
+## Recent changes
+
+- **18 November 2026:** Virtual-desktop cards and the **+** button work again on Windows 11 build 26300.
+- **30 October 2026:** **Ctrl + Win + Space** shows the fading Taskview++ banner each time it opens or closes the overview.
+- **24 October 2026:** Quiet desktop switching. Switching virtual desktops changes only what Taskview++ presents, with no native placement replay, automatic restores or forced focus. Docked windows keep their dock membership and owning desktop across switches.
+- **18 October 2026:** Focus stability. Focusing a tile keeps the real window at the exact position and size you chose, and the dock stays global when the overview is reopened from another desktop.
+
 ## Quick start
 
 Download the latest **Taskview++ Beta** Windows package from the project's GitHub Releases page, extract it, and run `StayView.exe`. The executable keeps its original internal name for compatibility.
@@ -45,8 +52,8 @@ The default overview shortcut is **Ctrl + Win + Space**. **Esc** dismisses the o
 - Dragging a tile pushes neighbours out of the way to keep Task View's spacing; neighbours slide back as you move away, a tile dropped squarely on another swaps places with it, and nothing is ever left overlapping another tile. Pinned tiles never move.
 - Pushing a dragged window into the desktop bar shows an electric plasma effect across the bar; with **Dock on bar contact** on (default) the window docks after a quarter of a second of contact. Both the effect and the behaviour can be switched off in Settings.
 - Hovering a docked window or a desktop card zooms it out into a larger live preview with a frame; moving away eases it back. Clicking while zoomed still undocks / switches desktop.
-- Switching desktops slides the whole layout in from the side of the desktop you are moving to (default **Slide** transition). Animations run in step with the display refresh.
-- A **Taskview++** banner shows while the app starts, when the overview is closed with Esc, and on exit.
+- Switching desktops is immediate by default (**Appear** transition): only the presented layout changes, with no native placement replay, automatic restores or forced focus. **Slide** and the other transitions remain available in Settings. Animations run in step with the display refresh.
+- A **Taskview++** banner shows while the app starts, each time **Ctrl + Win + Space** opens or closes the overview, when the overview is closed with Esc, and on exit.
 
 ## Window safety
 
@@ -60,7 +67,7 @@ Closed windows stay closed. Taskview++ does not fabricate replacement screenshot
 
 - Windows 11 x64.
 - The GitHub Releases Windows package is self-contained and does not require a separate .NET installation.
-- Full virtual-desktop controls use a private Windows shell interface that is deliberately build-gated to Windows builds 26100 through 26200. On unsupported builds, the current-desktop overview can still run, but private virtual-desktop operations are unavailable.
+- Full virtual-desktop controls use a private Windows shell interface that is deliberately build-gated to verified Windows builds 26100, 26200 and 26300. On unsupported builds, the current-desktop overview can still run, but private virtual-desktop operations are unavailable.
 
 ## Build from source
 

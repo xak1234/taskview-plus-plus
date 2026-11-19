@@ -50,7 +50,7 @@ sealed class DesktopConnection : IDisposable
     NamedPipeClientStream? pipe;StreamReader? reader;StreamWriter? writer;Process? process;
     public bool Ready {get;private set;}
     public DesktopConnection(){
-        if(Environment.OSVersion.Version.Build is <26100 or >26200)return;
+        if(!DesktopBuildSupport.IsSupported(Environment.OSVersion.Version.Build))return;
         try{
             string name="StayView.Desktops."+Guid.NewGuid().ToString("N");
             process=Process.Start(new ProcessStartInfo(Environment.ProcessPath!,"--desktop-broker "+name){UseShellExecute=false,CreateNoWindow=true});
@@ -135,7 +135,7 @@ public sealed class VirtualDesktopService
     }
     static DesktopConnection? Connection()
     {
-        if(Environment.OSVersion.Version.Build is <26100 or >26200)return null;
+        if(!DesktopBuildSupport.IsSupported(Environment.OSVersion.Version.Build))return null;
         lock(connectionGate)
         {
             if(connection?.Ready==true)return connection;
